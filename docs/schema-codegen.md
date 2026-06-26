@@ -102,6 +102,53 @@ rules — gaps consciously owned by the parser. The equivalence is not a
 one-time review: the codegen gate regenerates the schema from the types on every
 CI run, and the corpus gate pins the accept-side behavior.
 
+## Generated SDK types (drift oracle, Rust emitter)
+
+The SDK's wire TypeScript types are generated too — by a **Rust emitter**, with
+no third-party generator. `mxc_schema_gen --ts` walks the same generated schema
+value and `wxc_common::ts_emit` emits `sdk/src/generated/wire.ts`. That file is
+**not public API** — it is a drift oracle. The unit test
+`sdk/tests/unit/wire-conformance.test.ts` asserts (at `tsc` time) that the
+hand-written public types in `sdk/src/types.ts` still conform to it, and
+`check-sdk-types-codegen.js` is a CI gate (running the emitter and diffing the
+committed file) that fails on drift. So a wire-model change ripples to all three
+surfaces — Rust ⇄ schema ⇄ TS — and a forgotten SDK update fails CI instead of
+drifting silently. The emitter handles only the JSON Schema constructs the MXC
+schema uses (enums, closed/open objects, `$ref`, `anyOf [T, null]`, arrays,
+scalars); extending the wire model with a new construct may require teaching the
+emitter about it.
+
+### Why a hand-written emitter (alternatives considered)
+
+The generated `wire.ts` is a **drift oracle, not the public API**. The public
+SDK types (`sdk/src/types.ts`, `sdk/src/state-aware-types.ts`) stay
+hand-written, and the conformance test asserts they match the oracle. Two other
+approaches were evaluated and rejected:
+
+- **Generate the public API directly (generate-and-replace).** The public types
+  are a *curated* surface a raw generator can't reproduce: JSDoc, the branded
+  `SandboxId<C>`, the `IsolationSessionUserConfig` class (token redaction), and
+  a per-call-phase organization that deliberately does **not** map 1:1 to the
+  wire defs. Replacing them from a generator would either ship an un-ergonomic
+  API or get hand-massaged anyway, and would churn the public surface (and its
+  review diffs) on every wire tweak. The oracle gives identical, CI-enforced,
+  bidirectional drift safety without coupling the public ergonomics to generator
+  output.
+- **A third-party schema→TS generator (e.g. `json-schema-to-typescript`).** It
+  pulls ~15 transitive npm dependencies onto the public `MxcDependencies` feed,
+  where new transitive packages 401 until manually seeded — a recurring CI/
+  supply-chain cost. The in-repo emitter is a few hundred lines, has **zero
+  dependencies**, and handles exactly the constructs our schema uses, giving
+  exact control over the output so the conformance comparison stays precise.
+
+Either alternative could revisit the "devs run a script and check in" workflow,
+but that workflow already exists here (`mxc_schema_gen --ts`, enforced by the
+codegen gate) — only the *oracle* is generated, not the curated public types. A
+larger move (e.g. describing the config in a FlatBuffers IDL to emit both Rust
+and TS) would replace the JSON config contract itself and trade away
+human-authorable config files and `$schema` editor validation; out of scope
+here.
+
 ## Roadmap
 
 - The wire model generates the committed dev schema, guarded by the codegen and
@@ -109,5 +156,7 @@ CI run, and the corpus gate pins the accept-side behavior.
 - The parser deserializes directly into the wire model and the `Raw*` structs
   are gone, so the schema source and the trust boundary share one definition of
   the wire shape and cannot drift.
-- Next: generate the SDK TypeScript types from the same schema and retire the
-  hand-maintained `*-strict.json` stable view.
+- The SDK TypeScript wire types are generated from the same wire model
+  (`sdk/src/generated/wire.ts`, via the `wxc_common::ts_emit` Rust emitter),
+  guarded by a conformance test plus the `check-sdk-types-codegen.js` gate, and
+  the hand-maintained `*-strict.json` stable view has been retired.
