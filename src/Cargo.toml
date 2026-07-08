@@ -7,6 +7,7 @@ members = [
     "core/mxc-sdk",
     "core/mxc_pty",
     "core/mxc_build_common",
+    "host/plm",
     "core/generated/base_container_specification",
     "backends/appcontainer/common",
     "backends/windows_sandbox/daemon",
@@ -95,6 +96,8 @@ thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+roxmltree = "0.20"
 wxc_common = { path = "core/wxc_common" }
 appcontainer_common = { path = "backends/appcontainer/common" }
 windows_sandbox_common = { path = "backends/windows_sandbox/common" }
