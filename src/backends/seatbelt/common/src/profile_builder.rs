@@ -29,9 +29,14 @@ use std::fmt::Write as _;
 
 use wxc_common::models::{ClipboardPolicy, ExecutionRequest, NetworkPolicy, ProxyAddress};
 
-/// Build a complete sandbox profile, scoping cooperative proxy reachability to
-/// the resolved address supplied by the runner.
-pub(crate) fn build_profile_with_proxy(
+/// Build a complete Seatbelt sandbox profile, scoping cooperative proxy
+/// reachability to the resolved address supplied by the runner.
+///
+/// `pub` (not `pub(crate)`) so it stays a reachable API root: `profile_builder`
+/// is compiled and unit-tested on every host, but its only in-crate caller
+/// (`seatbelt_runner`) is `cfg(target_os = "macos")`, so on other targets a
+/// narrower visibility would make the whole profile-building chain dead code.
+pub fn build_profile_with_proxy(
     request: &ExecutionRequest,
     proxy_address: Option<&ProxyAddress>,
 ) -> Result<String, String> {
