@@ -779,7 +779,7 @@ describe('createConfigFromPolicy', () => {
       mockDarwin();
       try {
         const config = createConfigFromPolicy({
-          version: '0.5.0-alpha',
+          version: '0.7.0-alpha',
           network: { proxy: { url: 'http://127.0.0.1:8080' } },
         });
         assert.deepStrictEqual(config.network!.proxy, { url: 'http://127.0.0.1:8080' });
