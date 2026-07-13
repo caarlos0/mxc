@@ -3,16 +3,16 @@
 An importable Rust library for starting [MXC](../../../README.md) sandboxes
 **in-process**, without ever allocating a pty.
 
-Build a `SandboxRequest` from a [`SandboxPolicy`], then hand it to
-[`spawn_sandbox`]: it selects the
-right containment backend for the host and spawns the sandboxed process —
-returning a handle for live bidirectional stdio and termination.
+Build a `SandboxRequest` from a [`SandboxPolicy`], then either **run it to
+completion** with [`run`] (capturing stdout/stderr in one call) or hand it to
+[`spawn_sandbox`] for a live handle you can stream, feed stdin, and kill.
+Either way it selects the right containment backend for the host and runs the
+sandboxed process — no pty is ever allocated.
 
 ## Usage
 
 ```rust,no_run
-use std::io::Read;
-use mxc_sdk::{build_request, spawn_sandbox, SandboxPolicy, WaitOutcome};
+use mxc_sdk::{build_request, run, SandboxPolicy, WaitOutcome};
 
 // Describe what to restrict, turn it into a request, fill in the command.
 let policy = SandboxPolicy {
@@ -25,14 +25,16 @@ let policy = SandboxPolicy {
 let mut request = build_request(&policy, None)?;
 request.set_script("echo hello");
 
-let mut proc = spawn_sandbox(request)?;
-let mut stdout = proc.take_stdout().unwrap();
-let mut out = String::new();
-stdout.read_to_string(&mut out)?; // "hello\n"
-let outcome = proc.wait()?;       // drains/discards any untaken stream
-assert_eq!(outcome, WaitOutcome::Exited(0));
+// Run to completion and capture the output.
+let output = run(request)?;
+assert_eq!(output.outcome, WaitOutcome::Exited(0));
+assert_eq!(String::from_utf8_lossy(&output.stdout), "hello\n");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+[`run`] is the run-to-completion convenience (spawn + `wait_with_output`); use
+[`spawn_sandbox`] when you need to drive the process live (see
+[Live stdio + kill](#live-stdio--kill-streaming) below).
 
 [`build_request`] is the Rust port of the SDK's `createConfigFromPolicy`. It
 resolves the host's containment backend (Seatbelt on macOS, Bubblewrap on
@@ -144,9 +146,13 @@ pty, Seatbelt/Bubblewrap/AppContainer by inheriting the executor's stdio
 directly — a TTY when the executor has one). Output the caller doesn't
 take is drained and discarded by `wait()`.
 
-## Relationship to the executor binaries
+## Relationship to `mxc_engine` and the executor binaries
 
-The `wxc-exec`, `lxc-exec`, and `mxc-exec-mac` binaries do not depend on this
-crate. It reuses the same backend crates they do, but selects between them
-directly (no BFS/DACL `dispatch_with_fallback`) and spawns its own streaming
-handles.
+Backend dispatch, host probing, and config building live in the internal
+`mxc_engine` crate; this crate is a thin streaming facade that re-exports the
+curated engine surface and wraps the engine's streaming handle in [`Sandbox`].
+
+The `wxc-exec`, `lxc-exec`, and `mxc-exec-mac` binaries do not (yet) depend on
+this crate. The engine reuses the same backend crates they do, but the
+streaming path selects between them directly (no BFS/DACL
+`dispatch_with_fallback`) and spawns its own streaming handles.
