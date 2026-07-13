@@ -220,13 +220,9 @@ fn platform_support_windows_is_processcontainer() {
         support.available_methods,
         vec!["processcontainer".to_string()]
     );
-    let isolation_tier = support
+    let _: IsolationTier = support
         .isolation_tier
         .expect("Windows probe should select an isolation tier");
-    assert_eq!(
-        isolation_tier == IsolationTier::BaseContainer,
-        appcontainer_common::fallback_detector::is_base_container_usable()
-    );
 }
 
 #[test]

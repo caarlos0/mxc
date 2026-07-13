@@ -8,9 +8,9 @@
 //! backends are available. This lets callers stop depending on the TypeScript
 //! SDK for platform discovery.
 //!
-//! **Provisional.** Like the backend dispatch in `dispatch.rs`, this host
-//! probing is a temporary home; it moves to the future `mxc` engine crate that
-//! both `mxc-sdk` and the executor binaries will share.
+//! This host probing lives in the engine alongside the backend dispatch in
+//! `dispatch.rs`, so both the public SDK and the executor binaries can share a
+//! single implementation.
 
 #[cfg(target_os = "windows")]
 use appcontainer_common::fallback_detector::{self, IsolationTier as BackendIsolationTier};
@@ -125,4 +125,20 @@ fn command_succeeds(program: &str, args: &[&str]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base_container_tier_matches_probe() {
+        let isolation_tier = platform_support()
+            .isolation_tier
+            .expect("Windows probe should select an isolation tier");
+        assert_eq!(
+            isolation_tier == IsolationTier::BaseContainer,
+            appcontainer_common::fallback_detector::is_base_container_usable()
+        );
+    }
 }
