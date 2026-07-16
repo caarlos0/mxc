@@ -199,7 +199,7 @@ independently of the profile.
 | `allowedHosts` | Accepted for SDK compatibility, but Seatbelt cannot filter DNS names; the profile degrades to allow-all outbound as best-effort. |
 | `blockedHosts` | Rejected during validation because Seatbelt cannot enforce hostname blocks. |
 | `proxy` (loopback: `localhost` / `builtinTestServer`) | Under `defaultPolicy: "block"`, allows only the resolved `localhost:<proxy-port>`. Other loopback services and the wider network remain blocked. Under `allow`, the existing allow-all covers it. |
-| `proxy` (remote `url`) | Allows all outbound as best-effort — Seatbelt cannot filter by DNS name, so the proxy itself enforces host policy. |
+| `proxy` (remote `url`) | Under `defaultPolicy: "block"`, **rejected during validation** — Seatbelt cannot filter a remote proxy by DNS name, so reachability would degrade to allow-all and silently weaken the deny for raw-socket clients. Under `allow`, allows all outbound as best-effort (the proxy enforces host policy). Use a loopback proxy or `builtinTestServer` for MXC-scoped reachability under deny. |
 
 Proxy configuration (`network.proxy`) is supported via the **cooperative
 env-var model** (the same as the Bubblewrap backend): the runner launches or

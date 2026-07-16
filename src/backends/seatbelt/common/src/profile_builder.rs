@@ -243,6 +243,10 @@ fn write_outbound_allow_rules(out: &mut String) {
 /// Bubblewrap, which shares the host netns). For a remote proxy Seatbelt cannot
 /// filter by DNS name, so we fall back to allowing all outbound as a
 /// best-effort; the proxy itself enforces host policy for cooperating clients.
+/// Because that fallback would silently weaken a `defaultPolicy: "block"` for
+/// raw-socket clients, `config_parser` rejects remote-proxy + default-deny up
+/// front, so under deny this function only ever sees loopback proxies in
+/// practice (the remote arm remains as defense-in-depth).
 fn write_proxy_reachability_rules(out: &mut String, proxy_address: &ProxyAddress) {
     if matches!(proxy_address.host(), "127.0.0.1" | "::1" | "localhost") {
         let _ = writeln!(
@@ -652,6 +656,9 @@ mod tests {
     fn remote_proxy_under_default_deny_allows_all_outbound_best_effort() {
         // Seatbelt cannot filter a remote proxy by DNS name, so reachability
         // degrades to allow-all outbound (the proxy enforces host policy).
+        // NOTE: config_parser now rejects remote-proxy + defaultPolicy='block'
+        // for Seatbelt, so this combination is unreachable via real config; this
+        // test pins the profile-builder's defense-in-depth behavior if reached.
         let mut r = req();
         r.policy.default_network_policy = NetworkPolicy::Block;
         let addr = ProxyAddress::from_url(
