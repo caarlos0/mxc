@@ -399,8 +399,11 @@ function findUnixTestProxyBinary(): string {
  * Start unix-test-proxy in a child process.
  *
  * Binds to an OS-assigned port on `127.0.0.1` and writes it atomically to a
- * ready file. The proxy uses `PR_SET_PDEATHSIG` so it dies when the test
- * process exits — no cleanup-event mechanism is needed on Linux.
+ * ready file. The proxy watches its stdin for EOF as a cross-platform
+ * parent-death signal, so it must be spawned with a piped stdin that this
+ * process keeps open: when the test process exits the pipe closes, the proxy
+ * reads EOF and shuts down. An ignored/inherited `/dev/null` stdin would
+ * signal EOF immediately and make the proxy exit right after binding.
  */
 export function startUnixTestProxy(
   dir: string,
@@ -417,7 +420,10 @@ export function startUnixTestProxy(
     args.push('--block-host', host);
   }
 
-  const proxyProcess = spawn(proxyPath, args, { stdio: 'ignore' });
+  // stdin must stay open (piped, held by this process) so the proxy's
+  // stdin-EOF parent-death watcher only fires when the test process exits;
+  // `stdio: 'ignore'` would give it a `/dev/null` stdin that EOFs instantly.
+  const proxyProcess = spawn(proxyPath, args, { stdio: ['pipe', 'ignore', 'ignore'] });
 
   const deadline = Date.now() + 15000;
   while (!fs.existsSync(readyFile) && Date.now() < deadline) {
