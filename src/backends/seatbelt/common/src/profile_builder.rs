@@ -503,10 +503,11 @@ pub(crate) fn expand_tilde(path: &str) -> Result<String, String> {
 ///
 /// The guard is strict — it widens only when the path is exactly
 /// `/var/folders/<a>/<b>/<leaf>` with `<leaf>` one of `T`, `C`, or `0`
-/// (optionally under `/private`, the post-canonicalization form). A too-shallow
-/// path, a deeper path, a non-temp leaf, or any location outside `/var/folders`
-/// is left untouched, so a grant can never widen up to `/var/folders` (every
-/// user's containers) or `/`.
+/// (optionally under `/private`, the post-canonicalization form) and `<a>`/`<b>`
+/// are ordinary path segments (never empty, `.`, or `..`). A too-shallow path, a
+/// deeper path, a non-temp leaf, a `.`/`..` traversal segment, or any location
+/// outside `/var/folders` is left untouched, so a grant can never widen up to
+/// `/var/folders` (every user's containers) or `/`.
 fn darwin_temp_container_grant(path: &str) -> Option<String> {
     let trimmed = path.strip_suffix('/').unwrap_or(path);
     let (private_prefix, rest) = trimmed
@@ -516,8 +517,11 @@ fn darwin_temp_container_grant(path: &str) -> Option<String> {
     if segments.next()? != "var" || segments.next()? != "folders" {
         return None;
     }
-    let a = segments.next().filter(|s| !s.is_empty())?;
-    let b = segments.next().filter(|s| !s.is_empty())?;
+    // `<a>`/`<b>` must be ordinary segments; `.`/`..` would let a widened
+    // container escape upward (e.g. `/var/folders/ab/../T` -> `/var/folders`).
+    let ordinary = |s: &&str| !s.is_empty() && *s != "." && *s != "..";
+    let a = segments.next().filter(ordinary)?;
+    let b = segments.next().filter(ordinary)?;
     let leaf = segments.next()?;
     if segments.next().is_some() || !matches!(leaf, "T" | "C" | "0") {
         return None;
@@ -639,6 +643,10 @@ mod tests {
             "/var/folders/ab/cd/other",       // non-temp leaf
             "/Users/someone/tmp",             // outside /var/folders
             "/privateer/var/folders/ab/cd/T", // not the /private mount
+            "/var/folders/ab/../T",           // `..` escapes up to /var/folders
+            "/var/folders/../ab/T",           // `..` in the first segment
+            "/var/folders/ab/./T",            // `.` collapses to a too-shallow grant
+            "/var/folders/./cd/T",            // `.` in the first segment
         ] {
             assert_eq!(
                 darwin_temp_container_grant(path),
