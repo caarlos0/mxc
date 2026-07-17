@@ -165,6 +165,7 @@ fn write_filesystem_allow(out: &mut String, request: &ExecutionRequest) -> Resul
         out.push_str("(allow file-read* file-write*\n");
         for p in &policy.readwrite_paths {
             let expanded = expand_tilde(p)?;
+            let expanded = darwin_temp_container_grant(&expanded).unwrap_or(expanded);
             let _ = writeln!(out, "    (subpath {})", quote_scheme(&expanded));
         }
         out.push_str(")\n");
@@ -483,6 +484,47 @@ pub(crate) fn expand_tilde(path: &str) -> Result<String, String> {
     }
 }
 
+/// Widen a read-write grant that targets a per-user macOS Darwin temp/cache
+/// leaf to its enclosing per-user container, so all siblings are covered by one
+/// grant. Returns `None` when the path is not such a leaf.
+///
+/// On macOS `$TMPDIR` is the per-user `_CS_DARWIN_USER_TEMP_DIR`
+/// (`/var/folders/<a>/<b>/T/`); its siblings `C` (`_CS_DARWIN_USER_CACHE_DIR`)
+/// and `0` (misc) share the same per-user container but are otherwise
+/// unwritable. Granting only the `T` leaf denies tools that stage under the
+/// per-user cache, so a `T`/`C`/`0` grant is widened to the enclosing
+/// `/var/folders/<a>/<b>` container.
+///
+/// Applied unconditionally (not host-gated): a Seatbelt profile is always a
+/// macOS artifact regardless of the build host, matching the platform-agnostic
+/// `/private/var/folders` grant emitted for `guiAccess`. `deniedPaths` still
+/// override the widened grant, since they are emitted after the allow rules
+/// (last-match-wins).
+///
+/// The guard is strict — it widens only when the path is exactly
+/// `/var/folders/<a>/<b>/<leaf>` with `<leaf>` one of `T`, `C`, or `0`
+/// (optionally under `/private`, the post-canonicalization form). A too-shallow
+/// path, a deeper path, a non-temp leaf, or any location outside `/var/folders`
+/// is left untouched, so a grant can never widen up to `/var/folders` (every
+/// user's containers) or `/`.
+fn darwin_temp_container_grant(path: &str) -> Option<String> {
+    let trimmed = path.strip_suffix('/').unwrap_or(path);
+    let (private_prefix, rest) = trimmed
+        .strip_prefix("/private")
+        .map_or(("", trimmed), |rest| ("/private", rest));
+    let mut segments = rest.strip_prefix('/')?.split('/');
+    if segments.next()? != "var" || segments.next()? != "folders" {
+        return None;
+    }
+    let a = segments.next().filter(|s| !s.is_empty())?;
+    let b = segments.next().filter(|s| !s.is_empty())?;
+    let leaf = segments.next()?;
+    if segments.next().is_some() || !matches!(leaf, "T" | "C" | "0") {
+        return None;
+    }
+    Some(format!("{private_prefix}/var/folders/{a}/{b}"))
+}
+
 /// Quote a string for use as a TinyScheme string literal, escaping
 /// embedded backslashes and double-quotes.
 fn quote_scheme(s: &str) -> String {
@@ -554,6 +596,66 @@ mod tests {
         let p = build_profile(&r).unwrap();
         assert!(p.contains("(allow file-read* file-write*"));
         assert!(p.contains("(subpath \"/tmp/output\")"));
+    }
+
+    #[test]
+    fn darwin_temp_container_grant_widens_per_user_temp_to_container() {
+        // The temp (`T`), cache (`C`), and misc (`0`) leaves all widen to the
+        // enclosing per-user container, with and without a trailing slash.
+        assert_eq!(
+            darwin_temp_container_grant("/var/folders/ab/cd1234/T").as_deref(),
+            Some("/var/folders/ab/cd1234")
+        );
+        assert_eq!(
+            darwin_temp_container_grant("/var/folders/ab/cd1234/T/").as_deref(),
+            Some("/var/folders/ab/cd1234")
+        );
+        assert_eq!(
+            darwin_temp_container_grant("/var/folders/ab/cd1234/C").as_deref(),
+            Some("/var/folders/ab/cd1234")
+        );
+        assert_eq!(
+            darwin_temp_container_grant("/var/folders/ab/cd1234/0").as_deref(),
+            Some("/var/folders/ab/cd1234")
+        );
+        // The `/private`-anchored (post-canonicalization) form is preserved.
+        assert_eq!(
+            darwin_temp_container_grant("/private/var/folders/ab/cd1234/T").as_deref(),
+            Some("/private/var/folders/ab/cd1234")
+        );
+    }
+
+    #[test]
+    fn darwin_temp_container_grant_rejects_non_per_user_temp() {
+        // Never widen up to `/var/folders` (every user) or `/`, and never touch
+        // paths outside a genuine per-user Darwin container.
+        for path in [
+            "/tmp",
+            "/tmp/output",
+            "/var/folders",                   // too shallow
+            "/var/folders/ab",                // too shallow
+            "/var/folders/ab/cd",             // the container itself, no temp leaf
+            "/var/folders/ab/cd/T/nested",    // deeper than a leaf
+            "/var/folders/ab/cd/other",       // non-temp leaf
+            "/Users/someone/tmp",             // outside /var/folders
+            "/privateer/var/folders/ab/cd/T", // not the /private mount
+        ] {
+            assert_eq!(
+                darwin_temp_container_grant(path),
+                None,
+                "expected no widening for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn readwrite_temp_leaf_widens_to_container_in_profile() {
+        let mut r = req();
+        r.policy.readwrite_paths = vec!["/var/folders/ab/cd1234/T".into()];
+        let p = build_profile(&r).unwrap();
+        // The enclosing container is granted read-write, not just the `T` leaf.
+        assert!(p.contains("(subpath \"/var/folders/ab/cd1234\")"));
+        assert!(!p.contains("(subpath \"/var/folders/ab/cd1234/T\")"));
     }
 
     #[test]

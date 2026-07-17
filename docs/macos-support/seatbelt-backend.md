@@ -182,6 +182,16 @@ Apple's Seatbelt evaluates rules with last-match-wins semantics within an
 operation, so denies emitted after allows correctly override them. This
 matches MXC's `denied_paths` contract on every other backend.
 
+A `readwritePaths` entry that targets a per-user Darwin temp/cache leaf —
+`/var/folders/<a>/<b>/T` (`$TMPDIR` / `_CS_DARWIN_USER_TEMP_DIR`), `.../C`
+(`_CS_DARWIN_USER_CACHE_DIR`), or `.../0` (misc), optionally under `/private`
+— is widened to its enclosing per-user container `/var/folders/<a>/<b>`, so all
+three siblings are writable under one grant. Without this, a grant of only the
+temp leaf leaves the sibling cache directory unwritable and tools that stage
+there are denied. The widening is strict (only a direct `T`/`C`/`0` child of a
+genuine two-segment per-user container qualifies), so a grant can never widen up
+to `/var/folders` or `/`, and `deniedPaths` still override it.
+
 A baseline of read-only system paths (`/usr/lib`, `/usr/libexec`,
 `/usr/share`, `/System`, `/Library`, `/private/var/db/timezone`,
 `/private/var/db/dyld`, `/private/etc`, `/dev/null`, `/dev/zero`,
