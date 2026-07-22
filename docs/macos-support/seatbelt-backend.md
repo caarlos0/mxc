@@ -185,12 +185,15 @@ matches MXC's `denied_paths` contract on every other backend.
 A `readwritePaths` entry that targets a per-user Darwin temp/cache leaf —
 `/var/folders/<a>/<b>/T` (`$TMPDIR` / `_CS_DARWIN_USER_TEMP_DIR`), `.../C`
 (`_CS_DARWIN_USER_CACHE_DIR`), or `.../0` (misc), optionally under `/private`
-— is widened to its enclosing per-user container `/var/folders/<a>/<b>`, so all
-three siblings are writable under one grant. Without this, a grant of only the
-temp leaf leaves the sibling cache directory unwritable and tools that stage
-there are denied. The widening is strict (only a direct `T`/`C`/`0` child of a
-genuine two-segment per-user container qualifies), so a grant can never widen up
-to `/var/folders` or `/`, and `deniedPaths` still override it.
+— is expanded to read-write grants for all three siblings (`.../T`, `.../C`,
+`.../0`). Without this, a grant of only the temp leaf leaves the sibling cache
+directory unwritable and tools that stage there are denied. The expansion is
+strict (only a direct `T`/`C`/`0` child of a genuine two-segment per-user
+container qualifies) and covers *only* those three siblings — the enclosing
+container itself is never granted, so no other directory under it becomes
+writable and an expansion can never reach `/var/folders` or `/`. `deniedPaths`
+still override the expanded grants, so a caller can carve any one sibling back
+out.
 
 A baseline of read-only system paths (`/usr/lib`, `/usr/libexec`,
 `/usr/share`, `/System`, `/Library`, `/private/var/db/timezone`,
