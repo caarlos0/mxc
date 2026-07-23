@@ -6,7 +6,9 @@
 //!
 //! - [`available_tools_policy`], [`user_profile_policy`], and
 //!   [`temporary_files_policy`] enumerate the host environment to discover
-//!   tool/SDK/profile/temp directories as filesystem-policy fragments.
+//!   tool/SDK/profile/temp directories as filesystem-policy fragments;
+//!   [`materialize_tool_cache_writes`] then provisions the write-cache grants
+//!   [`available_tools_policy`] returns so a first sandboxed build can use them.
 //! - [`SandboxPolicy`] mirrors the SDK's cross-platform policy type, and
 //!   [`build_request`] maps it to an [`ExecutionRequest`] for the backends the
 //!   crate supports (Seatbelt, Bubblewrap, ProcessContainer) — so callers no
@@ -58,6 +60,31 @@ const KNOWN_ENV_VARS: &[(&str, bool)] = &[
     ("VIRTUAL_ENV", false),
     ("PYENV_ROOT", false),
 ];
+
+/// [`KNOWN_ENV_VARS`] entries whose value points at a *tool home* that holds
+/// credential/secret material at its root, so granting the whole directory (as
+/// the generic discovery does) would leak it. For these we grant only the
+/// credential-safe build-input subdirectories — mirroring the default-location
+/// scoping in [`home_tool_cache_policy_for`] but relative to the env var's value
+/// — so the two discovery halves are credential-safe consistently.
+///
+/// Each entry is `(var, readonly_subdirs, readwrite_file_subpaths)`. The
+/// read-only subdirs are existence-filtered like any other read grant; the
+/// read-write files are candidates materialized by
+/// [`materialize_tool_cache_writes`] (recognized via [`CARGO_RW_FILE_SUFFIXES`]).
+///
+/// Only `CARGO_HOME` currently qualifies: `~/.cargo` holds `credentials.toml` /
+/// `credentials` (the registry API token) beside the registry/git caches, and —
+/// unlike a tool's `bin` dir — the tool-home root is not normally on `PATH`, so
+/// scoping it here is sufficient. (Tool homes that *are* commonly on `PATH`,
+/// e.g. a user-local `DOTNET_ROOT`, would still be granted wholesale by the
+/// `PATH` scan, so scoping the env var alone would not close the leak; those are
+/// deliberately left out until the `PATH` interaction is addressed.)
+const CREDENTIAL_SCOPED_ENV_VARS: &[(&str, &[&str], &[&str])] = &[(
+    "CARGO_HOME",
+    &["registry", "git", "bin"],
+    &[".package-cache", ".global-cache"],
+)];
 
 fn is_windows() -> bool {
     cfg!(target_os = "windows")
@@ -283,19 +310,57 @@ fn powershell_policy(path_dirs: &[String], env: &[(String, String)]) -> Filesyst
     }
 }
 
-/// Discover tool and SDK directories from `env` (defaults to the process
-/// environment) as read-only policy paths.
+/// Discover the filesystem access common language toolchains need — the single
+/// entry point for tool/SDK discovery.
 ///
-/// Reads `PATH` plus a registry of well-known tool/SDK variables, then filters
-/// out non-existent and system-critical directories, and adds PowerShell paths
-/// when `pwsh.exe` is on `PATH`. The Rust port of `getAvailableToolsPolicy`.
-/// (The SDK's `processcontainer` AAP-ACL filter is Windows-runtime-specific and
-/// is applied server-side; it is not replicated here.)
-pub fn available_tools_policy(env: Option<&[(String, String)]>) -> FilesystemPolicyResult {
+/// Merges (and de-duplicates) up to two sources:
+///
+/// 1. **Env-var + `PATH` discovery** (always on). `PATH` plus a registry of
+///    well-known tool/SDK variables (`CARGO_HOME`, `GOPATH`, `RUSTUP_HOME`,
+///    `JAVA_HOME`, …), read from `env` (defaults to the process environment).
+///    Finds toolchains the user has *relocated* via those variables. Existence-
+///    and system-critical-filtered; adds PowerShell paths when `pwsh.exe` is on
+///    `PATH`. Credential-bearing tool homes (see [`CREDENTIAL_SCOPED_ENV_VARS`],
+///    e.g. `CARGO_HOME`) are scoped to their safe build-input subdirectories
+///    rather than granted wholesale, so a token stored at the root stays
+///    unreadable. The Rust port of `getAvailableToolsPolicy`. (The SDK's
+///    `processcontainer` AAP-ACL filter is Windows-runtime-specific and applied
+///    server-side; it is not replicated here.)
+/// 2. **Default-location home caches** (opt-in via `allow_dev_tool_caches`). The
+///    credential-safe registry/cache/toolchain subdirectories under the *process*
+///    home, for toolchains the user has *not* relocated (see
+///    [`home_tool_cache_policy_for`] for the full path list, the read/write split,
+///    and why the process home — never a caller- or command-env-controlled value
+///    — is the only safe source). Read grants are existence-filtered; write grants
+///    (the compiler scratch caches, `~/.gradle/caches` + `wrapper/dists`, and
+///    Cargo's root-level lock files, including those of a relocated `CARGO_HOME`)
+///    are returned as *candidates* that may not exist yet.
+///
+/// The home caches are gated because they change the granted paths and create
+/// cache directories, so they are a deliberate product opt-in (default off);
+/// env-var/`PATH` discovery — a strictly-narrowed view of what a relocated
+/// toolchain already exposes — is always returned. Neither source alone is
+/// sufficient in practice (most users have not exported the env vars, and a
+/// relocated toolchain is invisible to the home-cache scan), so when the opt-in
+/// is set both are returned together.
+///
+/// This function is **pure**: it never touches the filesystem beyond `stat`. The
+/// write-cache candidates it returns must be created before a deny-by-default
+/// sandbox can use them (a first build cannot create a path it has no grant to);
+/// call [`materialize_tool_cache_writes`] on the returned
+/// [`readwrite_paths`](FilesystemPolicyResult::readwrite_paths) to do so.
+/// Materialization is deliberately kept out of this function so merely
+/// discovering the policy — to inspect or serialize it, as the SDK tests do — has
+/// no side effects.
+pub fn available_tools_policy(
+    env: Option<&[(String, String)]>,
+    allow_dev_tool_caches: bool,
+) -> FilesystemPolicyResult {
     let env = env_or_process(env);
     let env: &[(String, String)] = &env;
 
     let mut collected = Vec::new();
+    let mut scoped_readwrite_files = Vec::new();
     let path_value = env_get(env, "PATH")
         .or_else(|| env_get(env, "Path"))
         .unwrap_or("");
@@ -304,6 +369,20 @@ pub fn available_tools_policy(env: Option<&[(String, String)]>) -> FilesystemPol
 
     for (name, is_list) in KNOWN_ENV_VARS {
         if let Some(value) = env_get(env, name) {
+            // Credential-bearing tool homes: grant only the safe subdirs, never
+            // the root (which holds a token/key beside the caches).
+            if let Some((_, readonly_subdirs, readwrite_files)) = CREDENTIAL_SCOPED_ENV_VARS
+                .iter()
+                .find(|(scoped, _, _)| scoped == name)
+            {
+                let base = value.trim();
+                if !base.is_empty() {
+                    collected.extend(readonly_subdirs.iter().map(|sub| join_str(base, &[sub])));
+                    scoped_readwrite_files
+                        .extend(readwrite_files.iter().map(|file| join_str(base, &[file])));
+                }
+                continue;
+            }
             let extracted = if *is_list {
                 split_path_list(value)
             } else {
@@ -313,19 +392,31 @@ pub fn available_tools_policy(env: Option<&[(String, String)]>) -> FilesystemPol
         }
     }
 
-    let filtered: Vec<String> = deduplicate_paths(&collected)
+    let mut readonly: Vec<String> = deduplicate_paths(&collected)
         .into_iter()
         .filter(|dir| directory_exists(dir) && !is_system_critical_path(dir))
         .collect();
 
     let pwsh = powershell_policy(&path_dirs, env);
-
-    let mut readonly = filtered;
     readonly.extend(pwsh.readonly_paths);
+    let mut readwrite = pwsh.readwrite_paths;
+
+    // Opt-in: the default-location home caches (read + scratch/lock-file writes)
+    // and the credential-scoped env vars' lock-file *write* grants (e.g. a
+    // relocated `CARGO_HOME`'s `.package-cache`). The env-var/`PATH` read
+    // discovery above — including the credential-safe read scoping — is always on
+    // because it only ever narrows what a relocated toolchain already exposed.
+    if allow_dev_tool_caches {
+        readwrite.extend(scoped_readwrite_files);
+        let home = process_home_tool_caches();
+        readonly.extend(home.readonly);
+        readwrite.extend(home.readwrite);
+        readwrite.extend(home.readwrite_files);
+    }
 
     FilesystemPolicyResult {
         readonly_paths: deduplicate_paths(&readonly),
-        readwrite_paths: deduplicate_paths(&pwsh.readwrite_paths),
+        readwrite_paths: deduplicate_paths(&readwrite),
     }
 }
 
@@ -388,6 +479,322 @@ pub fn temporary_files_policy(env: Option<&[(String, String)]>) -> FilesystemPol
         },
         _ => FilesystemPolicyResult::default(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Home-relative toolchain-cache discovery
+// ---------------------------------------------------------------------------
+
+/// Home-relative grants split by access mode, produced by
+/// [`home_tool_cache_policy_for`] and folded into [`available_tools_policy`].
+///
+/// Internal to the discovery pipeline. It carries a third bucket beyond
+/// [`FilesystemPolicyResult`]'s two: [`readwrite_files`](Self::readwrite_files).
+/// Read-write *files* are kept separate from read-write *directories* because
+/// they are materialized differently (touch an empty file vs `create_dir_all`).
+/// Cargo's root-level lock/tracker files are the only read-write files, and are
+/// granted individually so the credential-bearing `~/.cargo` root is never
+/// exposed. [`available_tools_policy`] flattens both write buckets into
+/// [`FilesystemPolicyResult::readwrite_paths`]; the file-vs-directory distinction
+/// is recovered by [`materialize_tool_cache_writes`] via
+/// [`CARGO_RW_FILE_SUFFIXES`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HomeToolCachePolicy {
+    /// Read-only build inputs (registries, module caches, installed toolchains,
+    /// version-manager installs). Existence-filtered by
+    /// [`process_home_tool_caches`].
+    readonly: Vec<String>,
+    /// Read-write *directory* grants — caches a build writes on every ordinary
+    /// invocation. Candidates: returned unfiltered so `materialize_*` can create
+    /// each before a downstream existence filter drops it.
+    readwrite: Vec<String>,
+    /// Read-write *file* grants (Cargo's root-level `.package-cache` flock and
+    /// `.global-cache` tracker). Candidates: touched (after ensuring the parent
+    /// exists) so the grant survives a first build.
+    readwrite_files: Vec<String>,
+}
+
+/// The default-location toolchain caches under the *process* home, folded into
+/// [`available_tools_policy`]. Read grants are existence-filtered; write grants
+/// are returned as (possibly not-yet-existing) candidates for
+/// [`materialize_tool_cache_writes`].
+///
+/// **Security — trusted home by construction.** The home is always the calling
+/// process's own home directory ([`std::env::home_dir`]), never a caller- or
+/// command-env-controlled value. This matters because the derived grants follow
+/// home-relative paths on disk: a child/config-controlled `HOME` (e.g. an MCP
+/// server's `config.env`) could point `.cargo/.global-cache` at a symlink to
+/// `~/.ssh` and have a downstream canonicalizing filter follow it. Reading the
+/// process home instead scopes the grants to the home whose caches these
+/// actually are, and it is present even when a sandboxed MCP/LSP server's
+/// curated env omits `HOME`.
+///
+/// Empty on Windows (its layouts differ; the env-var discovery in
+/// [`available_tools_policy`] covers the common `%LOCALAPPDATA%` cases).
+fn process_home_tool_caches() -> HomeToolCachePolicy {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let Some(home) = std::env::home_dir() else {
+            return HomeToolCachePolicy::default();
+        };
+        let home = home.to_string_lossy();
+        if home.is_empty() {
+            return HomeToolCachePolicy::default();
+        }
+        let mut policy = home_tool_cache_policy_for(&home, cfg!(target_os = "macos"));
+        // Read-only inputs a tool the user doesn't have shouldn't be granted;
+        // drop non-existent ones (matching the env-var discovery). The write
+        // buckets stay unfiltered so `materialize_tool_cache_writes` can create
+        // them before a first build needs them.
+        policy.readonly.retain(|dir| directory_exists(dir));
+        policy
+    }
+    #[cfg(target_os = "windows")]
+    {
+        HomeToolCachePolicy::default()
+    }
+}
+
+/// Pure, side-effect-free path-table generator behind
+/// [`process_home_tool_caches`].
+///
+/// Split out so the platform path shapes can be unit-tested deterministically
+/// (no filesystem access, `macos` taken as an explicit argument rather than read
+/// from `cfg!`). Every returned path is lexically contained within `home`.
+///
+/// **Credential-safe scoping.** Every entry targets a build-input *subdirectory*
+/// and never a tool-home root, so credential/key material stored beside the
+/// caches stays unreadable: `~/.cargo/credentials.toml`, `~/.npmrc`,
+/// `~/.m2/settings.xml`, `~/.gradle/gradle.properties`, `~/.gem/credentials`,
+/// `~/.nuget/NuGet.Config`, `~/.config/gh`, `~/.ssh`, `~/.gnupg`, and the .NET
+/// CurrentUser X509 store under `~/.dotnet/corefx/cryptography/x509stores` all
+/// sit outside the granted subdirectories. (Git/gh auth uses per-command token
+/// injection, not on-disk config grants.)
+///
+/// **Read vs write.** Read-only by default (enough to run an installed toolchain
+/// and build from a warm cache); only caches a build *writes* on every ordinary
+/// invocation are read-write — the compiler scratch caches (`go-build`,
+/// `ccache`, `sccache`), `~/.gradle/caches` (Gradle locks/updates it even on
+/// warm builds), and Cargo's root-level lock/tracker files. Cold dependency
+/// fetches (which also need network) stay a per-command bypass.
+///
+/// The path list is a curated allow-list of default toolchain locations,
+/// diverging from a plain read allow-list in two deliberate ways: the read/write
+/// split above (a read-only list would break the scratch caches) and the tighter
+/// credential-safe scoping.
+#[cfg(not(target_os = "windows"))]
+fn home_tool_cache_policy_for(home: &str, macos: bool) -> HomeToolCachePolicy {
+    let home = home.trim_end_matches('/');
+    let join = |rel: &str| format!("{home}/{rel}");
+
+    // Read-only build inputs common to macOS and Linux.
+    const COMMON_READONLY: &[&str] = &[
+        // Rust — never all of `~/.cargo` (`credentials.toml` lives there).
+        // `~/.rustup/settings.toml` is the (non-secret) default-toolchain
+        // selector a rustup-backed `cargo` shim reads on every invocation.
+        ".rustup/toolchains",
+        ".rustup/settings.toml",
+        ".cargo/registry",
+        ".cargo/git",
+        ".cargo/bin",
+        // Go — module cache is read-only by design; `go/bin` for installed tools.
+        "go/pkg/mod",
+        "go/bin",
+        // Node.js runtimes, package caches & version managers.
+        ".npm",
+        ".nvm/versions",
+        ".nvm/alias",
+        ".pnpm-store",
+        ".local/share/pnpm",
+        ".bun/install/cache",
+        ".bun/bin",
+        ".deno",
+        ".volta/bin",
+        ".volta/tools",
+        // fnm — `~/.fnm` is the legacy dir; the current platform defaults
+        // (`~/.local/share/fnm` / `~/Library/Application Support/fnm`) are added
+        // per-platform below.
+        ".fnm",
+        // asdf — source installs run `~/.asdf/bin/asdf`, which delegates to
+        // `~/.asdf/libexec`, so both are needed alongside the shims/installs.
+        ".asdf/bin",
+        ".asdf/libexec",
+        ".asdf/installs/nodejs",
+        ".asdf/shims",
+        ".local/share/mise/installs/node",
+        ".local/share/mise/shims",
+        ".electron-gyp",
+        ".node-gyp",
+        ".yarn/berry",
+        // Python. pyenv's source install delegates its shims to a bundled
+        // `libexec/pyenv`, so grant that too or shimmed commands can't exec.
+        ".local/share/virtualenv",
+        ".local/share/pipx",
+        ".pyenv/versions",
+        ".pyenv/shims",
+        ".pyenv/libexec",
+        // JVM — never the `~/.m2`/`~/.gradle` roots (settings.xml /
+        // gradle.properties). Gradle's caches AND `wrapper/dists` are granted
+        // **read-write** below: Gradle locks/updates its caches during ordinary
+        // (even warm-cache) builds, and the wrapper writes an `.ok` marker into
+        // the dist dir on every invocation — so a read-only grant makes them fail.
+        ".m2/repository",
+        ".sdkman/candidates",
+        // .NET — grant only the build/runtime subdirs, never the `~/.dotnet`
+        // root: `~/.dotnet/corefx/cryptography/x509stores` holds CurrentUser
+        // X509 stores (incl. PFX private keys) and the root would also expose a
+        // NuGet.Config. The `dotnet` executable itself is reached via PATH.
+        ".dotnet/sdk",
+        ".dotnet/shared",
+        ".dotnet/host",
+        ".dotnet/packs",
+        ".dotnet/templates",
+        ".dotnet/sdk-manifests",
+        ".dotnet/store",
+        ".dotnet/tools",
+        ".nuget/packages",
+        // NuGet's v3 HTTP cache is `~/.local/share/NuGet/v3-cache` on *both*
+        // macOS and Linux (not `~/Library/Caches` on macOS), so it is common.
+        ".local/share/NuGet/v3-cache",
+        // Ruby — `~/.gem/ruby` only; `~/.gem/credentials` holds the API key.
+        // rbenv's source install delegates its shims to a bundled `libexec/rbenv`.
+        ".gem/ruby",
+        ".rbenv/versions",
+        ".rbenv/shims",
+        ".rbenv/libexec",
+        ".rvm/rubies",
+        // C/C++ (Conan) — package + build folders only, never the `.conan2` root.
+        ".conan2/p",
+        ".conan2/b",
+    ];
+
+    // Platform cache roots differ: macOS `~/Library/Caches`, Linux XDG `~/.cache`.
+    let platform_readonly: &[&str] = if macos {
+        &[
+            "Library/Caches/node",
+            "Library/Caches/electron",
+            "Library/Caches/ms-playwright",
+            "Library/Caches/Yarn",
+            "Library/Caches/deno",
+            "Library/pnpm",
+            "Library/Caches/pip",
+            "Library/Caches/pypoetry",
+            "Library/Caches/uv",
+            // fnm's current default on macOS ($XDG_DATA_HOME/fnm fallback).
+            "Library/Application Support/fnm",
+            // node-gyp's current default (env-paths) on macOS; `~/.node-gyp`
+            // above is the legacy location.
+            "Library/Caches/node-gyp",
+        ]
+    } else {
+        &[
+            ".cache/node",
+            ".cache/node/corepack",
+            ".cache/electron",
+            ".cache/ms-playwright",
+            ".cache/yarn",
+            ".cache/deno",
+            ".cache/pip",
+            ".cache/pypoetry",
+            ".cache/uv",
+            // fnm's current default on Linux ($XDG_DATA_HOME/fnm fallback).
+            ".local/share/fnm",
+            // node-gyp's current default (env-paths) on Linux; `~/.node-gyp`
+            // above is the legacy location.
+            ".cache/node-gyp",
+        ]
+    };
+
+    // Caches a build writes on every ordinary invocation → read-write. Gradle's
+    // `~/.gradle/caches` and `~/.gradle/wrapper/dists` are here (not read-only)
+    // because Gradle locks/updates the caches even on warm builds and the wrapper
+    // writes an `.ok` marker into the dist dir on every run. The compiler scratch
+    // caches live under the platform cache root; sccache's default on macOS is the
+    // `directories`-crate `Mozilla.sccache` dir (org-qualified), not a bare `sccache`.
+    const COMMON_READWRITE: &[&str] = &[".gradle/caches", ".gradle/wrapper/dists"];
+    let platform_readwrite: &[&str] = if macos {
+        &[
+            "Library/Caches/go-build",
+            "Library/Caches/ccache",
+            "Library/Caches/Mozilla.sccache",
+        ]
+    } else {
+        &[".cache/go-build", ".cache/ccache", ".cache/sccache"]
+    };
+
+    HomeToolCachePolicy {
+        readonly: COMMON_READONLY
+            .iter()
+            .chain(platform_readonly)
+            .map(|&rel| join(rel))
+            .collect(),
+        readwrite: COMMON_READWRITE
+            .iter()
+            .chain(platform_readwrite)
+            .map(|&rel| join(rel))
+            .collect(),
+        // Cargo acquires `~/.cargo/.package-cache` (a flock) and updates the
+        // root-level `~/.cargo/.global-cache` tracker on every ordinary build,
+        // so both need read-write — but as individual files, never the
+        // `~/.cargo` root (which would expose `credentials.toml`).
+        readwrite_files: [".cargo/.package-cache", ".cargo/.global-cache"]
+            .iter()
+            .map(|&rel| join(rel))
+            .collect(),
+    }
+}
+
+/// Path suffixes marking a read-write grant as a *file* (touch), not a
+/// *directory* (`create_dir_all`) — Cargo's root-level lock/tracker files.
+/// [`available_tools_policy`] flattens the read-write buckets into one list, so
+/// [`materialize_tool_cache_writes`] recovers the distinction from these
+/// suffixes. Matched by *file basename* (not the `.cargo/` parent) so a relocated
+/// `CARGO_HOME` (e.g. `/opt/cargo/.package-cache`) is still recognized. They are
+/// granted individually (never the Cargo home root, which holds
+/// `credentials.toml`). Windows paths use `\`, so these `/`-suffixes never match
+/// there — which is correct, as Windows emits no such grants.
+const CARGO_RW_FILE_SUFFIXES: &[&str] = &["/.package-cache", "/.global-cache"];
+
+/// Create the read-write tool-cache grants from [`available_tools_policy`] so
+/// they survive a downstream existence filter and a first build can populate
+/// them: directories via `create_dir_all`, and Cargo's root-level lock/tracker
+/// files (recognized by [`CARGO_RW_FILE_SUFFIXES`]) created empty only if absent,
+/// their parent created first.
+///
+/// Pass the [`readwrite_paths`](FilesystemPolicyResult::readwrite_paths) returned
+/// by [`available_tools_policy`]. This is the one side-effecting step of tool
+/// discovery, kept separate so discovery itself stays pure; it is idempotent, a
+/// no-op for already-existing paths, and best-effort (a creation failure just
+/// leaves the path absent). Returns the subset that now exists, ready to merge
+/// into a read-write policy section.
+pub fn materialize_tool_cache_writes(readwrite_paths: &[String]) -> Vec<String> {
+    for path in readwrite_paths {
+        if CARGO_RW_FILE_SUFFIXES
+            .iter()
+            .any(|suffix| path.ends_with(suffix))
+        {
+            if let Some(parent) = Path::new(path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // `create_new` creates the file atomically *only if it does not
+            // already exist*, so a concurrent policy build — or Cargo itself —
+            // that created and populated `.package-cache`/`.global-cache` in the
+            // meantime is never clobbered. `File::create` would truncate it (a
+            // TOCTOU data-loss bug). `AlreadyExists` and any other error are
+            // ignored: an absent path is just filtered out below.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path);
+        } else {
+            let _ = std::fs::create_dir_all(path);
+        }
+    }
+    readwrite_paths
+        .iter()
+        .filter(|path| Path::new(path).exists())
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +1312,402 @@ mod tests {
                 .any(|p| p.contains("PSReadLine")),
             "expected PSReadLine history in readwrite paths: {:?}",
             result.readwrite_paths
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn home_tool_cache_policy_for_macos_uses_library_caches() {
+        use super::home_tool_cache_policy_for;
+        let p = home_tool_cache_policy_for("/Users/dev", true);
+        assert!(p
+            .readonly
+            .contains(&"/Users/dev/.cargo/registry".to_string()));
+        assert!(p
+            .readonly
+            .contains(&"/Users/dev/.rustup/toolchains".to_string()));
+        assert!(p.readonly.contains(&"/Users/dev/go/pkg/mod".to_string()));
+        assert!(p
+            .readonly
+            .contains(&"/Users/dev/Library/Caches/pip".to_string()));
+        // macOS never uses the XDG `~/.cache` layout.
+        assert!(!p.readonly.iter().any(|x| x.contains("/.cache/")));
+        // fnm's current macOS default.
+        assert!(p
+            .readonly
+            .contains(&"/Users/dev/Library/Application Support/fnm".to_string()));
+        // node-gyp's current env-paths default on macOS.
+        assert!(p
+            .readonly
+            .contains(&"/Users/dev/Library/Caches/node-gyp".to_string()));
+        assert!(p
+            .readwrite
+            .contains(&"/Users/dev/Library/Caches/go-build".to_string()));
+        assert!(!p.readwrite.iter().any(|x| x.contains("/.cache/")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn home_tool_cache_policy_for_linux_uses_xdg_cache() {
+        use super::home_tool_cache_policy_for;
+        let p = home_tool_cache_policy_for("/home/dev", false);
+        assert!(p
+            .readonly
+            .contains(&"/home/dev/.cargo/registry".to_string()));
+        assert!(p.readonly.contains(&"/home/dev/.cache/pip".to_string()));
+        // Linux never uses the macOS `~/Library/Caches` layout.
+        assert!(!p.readonly.iter().any(|x| x.contains("Library/Caches")));
+        // fnm's current Linux default.
+        assert!(p
+            .readonly
+            .contains(&"/home/dev/.local/share/fnm".to_string()));
+        // node-gyp's current env-paths default on Linux.
+        assert!(p
+            .readonly
+            .contains(&"/home/dev/.cache/node-gyp".to_string()));
+        assert!(p
+            .readwrite
+            .contains(&"/home/dev/.cache/go-build".to_string()));
+        assert!(p
+            .readwrite
+            .contains(&"/home/dev/.cache/sccache".to_string()));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn home_tool_cache_policy_for_never_escapes_the_provided_home() {
+        use super::home_tool_cache_policy_for;
+        // SECURITY: callers must feed a *trusted* home (the process HOME, not a
+        // child/config-controlled command-env HOME — see the SECURITY note on
+        // `process_home_tool_caches`). This guards the complementary invariant:
+        // every derived candidate (read-only, read-write dirs, and the Cargo lock
+        // files) is lexically contained within the provided home and contains no
+        // `..` traversal, so a trusted home can only ever yield grants inside
+        // itself before canonicalization.
+        for macos in [true, false] {
+            let home = "/home/dev";
+            let p = home_tool_cache_policy_for(home, macos);
+            let all = p
+                .readonly
+                .iter()
+                .chain(p.readwrite.iter())
+                .chain(p.readwrite_files.iter());
+            for path in all {
+                assert!(
+                    path.starts_with(&format!("{home}/")),
+                    "path {path} escapes home {home} (macos={macos})"
+                );
+                assert!(
+                    !path.split('/').any(|seg| seg == ".."),
+                    "path {path} contains a `..` traversal (macos={macos})"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn home_tool_cache_policy_for_classifies_read_vs_write() {
+        use super::home_tool_cache_policy_for;
+        let p = home_tool_cache_policy_for("/home/dev", false);
+        // Module cache & installed toolchains are read-only.
+        assert!(p.readonly.contains(&"/home/dev/go/pkg/mod".to_string()));
+        assert!(p
+            .readonly
+            .contains(&"/home/dev/.rustup/toolchains".to_string()));
+        assert!(!p.readwrite.iter().any(|x| x.contains("pkg/mod")));
+        // Pure compiler caches are read-write, never read-only.
+        assert!(!p.readonly.iter().any(|x| x.ends_with("go-build")));
+        assert!(p
+            .readwrite
+            .contains(&"/home/dev/.cache/go-build".to_string()));
+        // Gradle's cache locks/writes on every build, so it is read-write, not
+        // read-only (regression guard for the reviewer-reported failure).
+        assert!(
+            p.readwrite
+                .contains(&"/home/dev/.gradle/caches".to_string()),
+            "gradle caches must be read-write, got {:?}",
+            p.readwrite
+        );
+        assert!(!p.readonly.iter().any(|x| x.ends_with(".gradle/caches")));
+        // The Gradle wrapper writes an `.ok` marker into the dist dir on every
+        // run, so `wrapper/dists` is read-write too — never read-only.
+        assert!(
+            p.readwrite
+                .contains(&"/home/dev/.gradle/wrapper/dists".to_string()),
+            "gradle wrapper/dists must be read-write, got {:?}",
+            p.readwrite
+        );
+        assert!(!p.readonly.iter().any(|x| x.ends_with("wrapper/dists")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn home_tool_cache_policy_for_grants_shim_libexec_and_narrows_dotnet() {
+        use super::home_tool_cache_policy_for;
+        for macos in [true, false] {
+            let p = home_tool_cache_policy_for("/home/dev", macos);
+            // pyenv/rbenv/asdf source installs delegate their shims to a bundled
+            // libexec/launcher, so it must be granted or shimmed commands can't exec.
+            assert!(p.readonly.contains(&"/home/dev/.pyenv/libexec".to_string()));
+            assert!(p.readonly.contains(&"/home/dev/.rbenv/libexec".to_string()));
+            assert!(p.readonly.contains(&"/home/dev/.asdf/bin".to_string()));
+            assert!(p.readonly.contains(&"/home/dev/.asdf/libexec".to_string()));
+            // .NET grants specific build subdirs, never the `.dotnet` root.
+            assert!(p.readonly.contains(&"/home/dev/.dotnet/sdk".to_string()));
+            assert!(!p.readonly.iter().any(|x| x.ends_with("/.dotnet")));
+            // rustup's default-toolchain selector is read on every cargo run.
+            assert!(p
+                .readonly
+                .contains(&"/home/dev/.rustup/settings.toml".to_string()));
+            // NuGet's v3 HTTP cache is `~/.local/share/NuGet/v3-cache` on both
+            // platforms, never `~/Library/Caches/NuGet` on macOS.
+            assert!(p
+                .readonly
+                .contains(&"/home/dev/.local/share/NuGet/v3-cache".to_string()));
+            assert!(!p
+                .readonly
+                .iter()
+                .any(|x| x.contains("Library/Caches/NuGet")));
+            // Cargo's root-level lock/tracker files are read-write *files* (never
+            // the `.cargo` root), so warm-cache `cargo build` can lock/write them.
+            assert!(p
+                .readwrite_files
+                .contains(&"/home/dev/.cargo/.package-cache".to_string()));
+            assert!(p
+                .readwrite_files
+                .contains(&"/home/dev/.cargo/.global-cache".to_string()));
+            assert!(!p.readwrite_files.iter().any(|x| x.ends_with("/.cargo")));
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn home_tool_cache_policy_for_macos_sccache_uses_mozilla_dir() {
+        use super::home_tool_cache_policy_for;
+        let p = home_tool_cache_policy_for("/home/dev", true);
+        // sccache's macOS default (via the `directories` crate) is the
+        // org-qualified `Mozilla.sccache`, not a bare `sccache` dir.
+        assert!(p
+            .readwrite
+            .contains(&"/home/dev/Library/Caches/Mozilla.sccache".to_string()));
+        assert!(!p
+            .readwrite
+            .iter()
+            .any(|x| x.ends_with("Library/Caches/sccache")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn home_tool_cache_policy_for_trims_trailing_home_slash() {
+        use super::home_tool_cache_policy_for;
+        let p = home_tool_cache_policy_for("/home/dev/", false);
+        assert!(p
+            .readonly
+            .contains(&"/home/dev/.cargo/registry".to_string()));
+        assert!(!p.readonly.iter().any(|x| x.contains("//")));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn home_tool_cache_policy_for_excludes_credential_material() {
+        use super::home_tool_cache_policy_for;
+        let home = "/home/dev";
+        for macos in [true, false] {
+            let p = home_tool_cache_policy_for(home, macos);
+            let all: Vec<&String> = p
+                .readonly
+                .iter()
+                .chain(p.readwrite.iter())
+                .chain(p.readwrite_files.iter())
+                .collect();
+            // Never grant a tool-home root or a known credential/config file that
+            // sits beside the caches (read alone leaks the secret).
+            for forbidden in [
+                "/home/dev/.cargo",
+                "/home/dev/.gem",
+                "/home/dev/.m2",
+                "/home/dev/.gradle",
+                "/home/dev/.nuget",
+                "/home/dev/.conan2",
+                "/home/dev/.dotnet",
+                "/home/dev/.dotnet/corefx/cryptography/x509stores",
+                "/home/dev/.npmrc",
+                "/home/dev/.m2/settings.xml",
+                "/home/dev/.gradle/gradle.properties",
+                "/home/dev/.gem/credentials",
+                "/home/dev/.nuget/NuGet.Config",
+                "/home/dev/.config/gh",
+                "/home/dev/.ssh",
+                "/home/dev/.gnupg",
+            ] {
+                assert!(
+                    !all.iter().any(|x| x.as_str() == forbidden),
+                    "must not grant {forbidden} (macos={macos})"
+                );
+            }
+            // Defense in depth: nothing that names a secret store or the .NET
+            // CurrentUser X509 certificate/key store.
+            assert!(
+                !all.iter().any(|x| x.contains("credentials")),
+                "macos={macos}"
+            );
+            assert!(
+                !all.iter()
+                    .any(|x| x.contains("x509stores") || x.contains("cryptography")),
+                "macos={macos}"
+            );
+            assert!(!all.iter().any(|x| x.ends_with(".npmrc")), "macos={macos}");
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn available_tools_policy_folds_in_existing_home_read_caches() {
+        use super::available_tools_policy;
+        // With the dev-tool-cache opt-in on and an empty env (no PATH / tool env
+        // vars), the read-only result is purely the process-home caches,
+        // existence-filtered — so every returned read-only path must exist.
+        // `available_tools_policy` is pure (no disk writes), so calling it here has
+        // no side effects. Environment-independent: an empty result is valid on a
+        // host with none of the toolchains.
+        let result = available_tools_policy(Some(&[]), true);
+        for dir in &result.readonly_paths {
+            assert!(
+                std::path::Path::new(dir).exists(),
+                "read-only grant does not exist: {dir}"
+            );
+        }
+        // Credential-safety holds through the merged discovery too: no tool-home
+        // root or credential file leaks into the read set.
+        for forbidden in [".npmrc", "credentials.toml", ".gnupg"] {
+            assert!(
+                !result.readonly_paths.iter().any(|p| p.ends_with(forbidden)),
+                "must not grant {forbidden}: {:?}",
+                result.readonly_paths
+            );
+        }
+        // Opt-in off: no home caches at all.
+        assert!(
+            available_tools_policy(Some(&[]), false)
+                .readonly_paths
+                .is_empty(),
+            "no home caches must be granted when the opt-in is off"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn available_tools_policy_scopes_credential_bearing_cargo_home() {
+        use super::available_tools_policy;
+
+        // A relocated CARGO_HOME with a registry cache and a secret beside it.
+        let base = std::env::temp_dir().join(format!(
+            "mxc_cargo_home_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let base_str = base.to_string_lossy().into_owned();
+        std::fs::create_dir_all(base.join("registry")).expect("create registry");
+        std::fs::write(base.join("credentials.toml"), b"token").expect("write secret");
+
+        // Empty PATH so only the scoped CARGO_HOME drives the env-var discovery.
+        let env = vec![
+            ("PATH".to_string(), String::new()),
+            ("CARGO_HOME".to_string(), base_str.clone()),
+        ];
+        let result = available_tools_policy(Some(&env), true);
+
+        let registry = format!("{base_str}/registry");
+        let package_cache = format!("{base_str}/.package-cache");
+        let root_granted = result.readonly_paths.iter().any(|p| p == &base_str);
+        let registry_granted = result.readonly_paths.contains(&registry);
+        let lockfile_scoped = result.readwrite_paths.contains(&package_cache);
+        let secret_leak = result
+            .readonly_paths
+            .iter()
+            .any(|p| p.contains("credentials"));
+
+        // Opt-in off: the read scoping (registry granted, root/secret never) still
+        // holds — it only narrows the always-on env-var discovery — but the
+        // relocated lock-file *write* grant is withheld.
+        let off = available_tools_policy(Some(&env), false);
+        let off_registry_granted = off.readonly_paths.contains(&registry);
+        let off_root_granted = off.readonly_paths.iter().any(|p| p == &base_str);
+        let off_lockfile_withheld = !off.readwrite_paths.contains(&package_cache);
+
+        // Clean up before asserting so a failure leaves nothing behind.
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            registry_granted,
+            "the registry subdir must be granted: {:?}",
+            result.readonly_paths
+        );
+        assert!(
+            !root_granted,
+            "the CARGO_HOME root must not be granted (it holds credentials.toml)"
+        );
+        assert!(
+            !secret_leak,
+            "no credential path may be granted: {:?}",
+            result.readonly_paths
+        );
+        assert!(
+            lockfile_scoped,
+            "the Cargo lock file must be scoped under CARGO_HOME: {:?}",
+            result.readwrite_paths
+        );
+        assert!(
+            off_registry_granted && !off_root_granted && off_lockfile_withheld,
+            "opt-in off: registry read scoping stays, lock-file write is withheld (ro={:?} rw={:?})",
+            off.readonly_paths,
+            off.readwrite_paths
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn materialize_tool_cache_writes_creates_dirs_and_touches_cargo_files() {
+        use super::{home_tool_cache_policy_for, materialize_tool_cache_writes};
+
+        // Against a real temp home, materialize creates the read-write cache dirs
+        // and touches the Cargo lock files, and returns the now-existing subset.
+        // Built from the pure path table (flattened as `available_tools_policy`
+        // does) so no process-env home is touched.
+        let home = std::env::temp_dir().join(format!(
+            "mxc_tool_cache_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let home_str = home.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&home).expect("create temp home");
+
+        let table = home_tool_cache_policy_for(&home_str, false);
+        let mut readwrite = table.readwrite.clone();
+        readwrite.extend(table.readwrite_files.clone());
+        let existing = materialize_tool_cache_writes(&readwrite);
+
+        let gradle = format!("{home_str}/.gradle/caches");
+        let package_cache = format!("{home_str}/.cargo/.package-cache");
+        let created_ok = existing.contains(&gradle)
+            && std::path::Path::new(&gradle).is_dir()
+            // The Cargo lock file must be a *file* (touched), never a directory.
+            && existing.contains(&package_cache)
+            && std::path::Path::new(&package_cache).is_file();
+
+        // Clean up before asserting so a failure leaves nothing behind.
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert!(
+            created_ok,
+            "materialize must create the read-write cache dir and touch the Cargo lock file"
         );
     }
 
