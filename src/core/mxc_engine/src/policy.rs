@@ -468,7 +468,7 @@ pub fn temporary_files_policy(env: Option<&[(String, String)]>) -> FilesystemPol
 /// files, granted individually so the credential-bearing `~/.cargo` root is never
 /// exposed. [`available_tools_policy`] flattens both write buckets into
 /// [`FilesystemPolicyResult::readwrite_paths`]; [`materialize_tool_cache_writes`]
-/// recovers the file-vs-directory split via [`CARGO_RW_FILE_SUFFIXES`].
+/// recovers the file-vs-directory split via [`CARGO_RW_FILE_NAMES`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct HomeToolCachePolicy {
     /// Read-only build inputs. Existence-filtered by [`process_home_tool_caches`].
@@ -685,17 +685,20 @@ fn home_tool_cache_policy_for(home: &str, macos: bool) -> HomeToolCachePolicy {
 
 /// Path suffixes marking a read-write grant as a *file* (create empty), not a
 /// *directory* (`create_dir_all`) — Cargo's root-level lock/tracker files.
-/// [`materialize_tool_cache_writes`] uses these to recover the file/dir split
-/// after [`available_tools_policy`] flattens the write buckets. Matched by
-/// basename so a relocated `CARGO_HOME` (`/opt/cargo/.package-cache`) still
-/// matches; Windows uses `\`, so these never match there (correctly — it emits
-/// no such grants).
-const CARGO_RW_FILE_SUFFIXES: &[&str] = &["/.package-cache", "/.global-cache"];
+/// File names (not directories) among the read-write tool-cache grants: Cargo's
+/// root-level lock/tracker files, which must be created empty (never
+/// `create_dir_all`'d). [`materialize_tool_cache_writes`] uses these to recover
+/// the file/dir split after [`available_tools_policy`] flattens the write
+/// buckets. Matched on the final path component (via [`Path::file_name`], so it
+/// is separator-agnostic and works for a relocated `CARGO_HOME` on any platform).
+/// Granted individually so the `CARGO_HOME` root — which holds `credentials.toml`
+/// — is never exposed.
+const CARGO_RW_FILE_NAMES: &[&str] = &[".package-cache", ".global-cache"];
 
 /// Create the read-write tool-cache grants from [`available_tools_policy`] so
 /// they survive a downstream existence filter and a first build can populate
 /// them: directories via `create_dir_all`, Cargo's lock/tracker files (see
-/// [`CARGO_RW_FILE_SUFFIXES`]) created empty only if absent.
+/// [`CARGO_RW_FILE_NAMES`]) created empty only if absent.
 ///
 /// Pass [`available_tools_policy`]'s
 /// [`readwrite_paths`](FilesystemPolicyResult::readwrite_paths). This is the one
@@ -703,10 +706,11 @@ const CARGO_RW_FILE_SUFFIXES: &[&str] = &["/.package-cache", "/.global-cache"];
 /// idempotent and best-effort. Returns the subset that now exists.
 pub fn materialize_tool_cache_writes(readwrite_paths: &[String]) -> Vec<String> {
     for path in readwrite_paths {
-        if CARGO_RW_FILE_SUFFIXES
-            .iter()
-            .any(|suffix| path.ends_with(suffix))
-        {
+        let is_cargo_lock_file = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| CARGO_RW_FILE_NAMES.contains(&name));
+        if is_cargo_lock_file {
             if let Some(parent) = Path::new(path).parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -1630,6 +1634,52 @@ mod tests {
         assert!(
             created_ok,
             "materialize must create the read-write cache dir and touch the Cargo lock file"
+        );
+    }
+
+    #[test]
+    fn materialize_tool_cache_writes_detects_cargo_lock_by_basename() {
+        use super::materialize_tool_cache_writes;
+
+        // Regression guard for the separator-agnostic lock-file detection: build
+        // the paths with `PathBuf::join` so each platform uses its native
+        // separator (`\` on Windows, `/` elsewhere). A relocated CARGO_HOME lock
+        // file must be created as a *file*, and a plain cache dir as a *directory*.
+        let base = std::env::temp_dir().join(format!(
+            "mxc_cargo_sep_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).expect("create temp base");
+
+        let lock = base.join(".package-cache");
+        let cache_dir = base.join("go-build");
+        let readwrite = vec![
+            lock.to_string_lossy().into_owned(),
+            cache_dir.to_string_lossy().into_owned(),
+        ];
+        let existing = materialize_tool_cache_writes(&readwrite);
+
+        let lock_is_file = lock.is_file();
+        let dir_is_dir = cache_dir.is_dir();
+        let both_returned = existing.len() == 2;
+
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(
+            lock_is_file,
+            "the Cargo lock file must be created as a file, not a directory"
+        );
+        assert!(
+            dir_is_dir,
+            "a non-lock cache path must be created as a directory"
+        );
+        assert!(
+            both_returned,
+            "both existing grants must be returned: {existing:?}"
         );
     }
 
