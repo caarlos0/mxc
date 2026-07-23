@@ -670,12 +670,17 @@ impl BaseContainerRunner {
         // 3. Build the command line (passed directly, same as AppContainerScriptRunner).
         let mut cmd_wide = string_util::to_wide(&request.script_code);
 
-        // Working directory (NULL falls back to the current directory).
+        // Working directory. An explicit cwd wins; otherwise fall back to the
+        // first granted path so the sandboxed child starts somewhere the
+        // AppContainer token can open. Passing NULL here would inherit this
+        // process's cwd, and if the AppContainer can't open it the kernel
+        // silently resets the child to the drive root (C:\).
+        let working_directory = request.resolved_working_directory().unwrap_or_default();
         let cwd_wide;
-        let cwd_ptr = if request.working_directory.is_empty() {
+        let cwd_ptr = if working_directory.is_empty() {
             ptr::null()
         } else {
-            cwd_wide = string_util::to_wide(&request.working_directory);
+            cwd_wide = string_util::to_wide(working_directory);
             cwd_wide.as_ptr()
         };
 
