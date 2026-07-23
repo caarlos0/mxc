@@ -37,8 +37,6 @@ fn platform_support_macos_is_seatbelt() {
 #[test]
 fn available_tools_policy_filters_nonexistent_and_dedups() {
     // A real dir (cwd), a bogus dir, and the real dir again under a known var.
-    // Use GOROOT (granted wholesale) rather than CARGO_HOME, which is now scoped
-    // to credential-safe subdirs and so would not re-contribute the cwd root.
     let cwd = std::env::current_dir()
         .unwrap()
         .to_string_lossy()
@@ -51,7 +49,6 @@ fn available_tools_policy_filters_nonexistent_and_dedups() {
     let path_val = format!("{cwd}{sep}/this/does/not/exist/xyzzy");
     let env = env_pairs(&[("PATH", &path_val), ("GOROOT", &cwd)]);
 
-    // Dev-tool caches off: this exercises the always-on env-var/PATH discovery.
     let result = available_tools_policy(Some(&env), false);
 
     assert!(
