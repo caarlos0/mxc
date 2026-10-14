@@ -49,7 +49,7 @@ requiring root privileges or a container runtime.
   the complete `getPlatformSupport()` result, including failures, for the module
   lifetime; restart the Node process after remediating the host.
 - **Network-enabled private-namespace modes (v0.9+):** `slirp4netns` installed
-  and on PATH, plus util-linux `unshare` (with `--map-current-user` and
+  and on PATH, plus iproute2 `ip`, util-linux `unshare` (with `--map-current-user` and
   `--keep-caps`), `nsenter`, `iptables`, `ip6tables`, `iptables-restore`, and
   `ip6tables-restore` for the in-namespace egress and ingress rules, a POSIX
   `sh` (the supervisor runs as `sh -c`), and the
@@ -73,13 +73,13 @@ requiring root privileges or a container runtime.
   > because they ship in the same package as `iptables`.
   ```bash
   # Debian/Ubuntu
-  sudo apt install slirp4netns util-linux iptables
+  sudo apt install slirp4netns util-linux iptables iproute2
 
   # Fedora/RHEL
-  sudo dnf install slirp4netns util-linux iptables
+  sudo dnf install slirp4netns util-linux iptables iproute
 
   # Alpine
-  apk add slirp4netns util-linux iptables
+  apk add slirp4netns util-linux iptables iproute2
   ```
   `iptables` should resolve to the **`nf_tables` backend** (the default on
   Debian 10+, Ubuntu 20.10+, RHEL 8+, and Alpine). The `iptables-legacy`
@@ -661,7 +661,7 @@ shared-host-network behavior.
 
 0. Before anything is launched, `validate` probes the host tools this mode
    depends on — `slirp4netns`, `unshare` (checked for `--map-current-user` and
-   `--keep-caps`), `sh`, `nsenter`, `iptables`, `ip6tables`, `iptables-restore`, and
+   `--keep-caps`), `sh`, `nsenter`, `ip`, `iptables`, `ip6tables`, `iptables-restore`, and
    `ip6tables-restore` — so a host that is
    missing one fails immediately with a message naming it, rather than partway
    through supervisor startup. For the `iptables` family presence is not
@@ -680,7 +680,13 @@ shared-host-network behavior.
    IPv4. Use a proxy listening on `127.0.0.1` or `localhost`.
 2. The runner creates a same-UID user-namespace supervisor, starts Bubblewrap
    with `--unshare-net`, and keeps the workload behind a startup barrier.
-3. The supervisor attaches `slirp4netns` to Bubblewrap's private network
+3. The supervisor waits for Bubblewrap's loopback to be up with
+   `127.0.0.1/8`, querying the child network namespace with `nsenter` and `ip`.
+   The child-PID notification is not a setup-ready signal: starting slirp
+   before loopback is initialized can create the address before Bubblewrap's
+   exclusive address request and fail startup. Query errors fail startup;
+   the wait shares the existing network-startup deadline.
+   Only then does the supervisor attach `slirp4netns` to the private network
    namespace. Host-loopback proxy endpoints are presented to the sandbox
    through slirp's `10.0.2.2` host gateway. Once slirp is up, the supervisor
    programs a default-DROP `MXC_EGRESS` chain into that namespace via
@@ -895,7 +901,7 @@ Contract `0.9.0-alpha` provides no MXC-managed host-list policy for that proxy.
 | Rootfs | Downloads distro rootfs | Bind-mounts host filesystem |
 | Startup | Create → Start → Attach | Single `bwrap` exec; proxy-only and firewall-enforced modes add a user/network-namespace supervisor, `slirp4netns`, and namespace-local firewall chains |
 | Network isolation | iptables + veth | `--unshare-net` for ruleless deny; private netns + slirp4netns and namespace-local iptables for proxy or firewall-enforced policies |
-| Dependencies | `lxc-*` tools, templates | `bwrap`; proxy and firewall-enforced modes also need `slirp4netns`, util-linux `unshare` and `nsenter`, a POSIX `sh`, plus `iptables`, `ip6tables` and their `-restore` counterparts |
+| Dependencies | `lxc-*` tools, templates | `bwrap`; proxy and firewall-enforced modes also need `slirp4netns`, util-linux `unshare` and `nsenter`, iproute2 `ip`, a POSIX `sh`, plus `iptables`, `ip6tables` and their `-restore` counterparts |
 | Lifecycle | Create/destroy containers | Process dies on exit; proxy mode's supervisor is reaped with it |
 
 **When to use Bubblewrap:**

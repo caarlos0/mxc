@@ -771,7 +771,7 @@ export interface ProbeFacts {
  *
  * Schema `0.9.0-alpha`+ proxy policies run the sandbox in a private network
  * namespace and default-drop everything except the proxy endpoint. That
- * requires host tooling (slirp4netns, util-linux unshare, nsenter, the
+ * requires host tooling (slirp4netns, util-linux unshare, nsenter, iproute2 ip, the
  * iptables family) plus unprivileged user and network namespaces the kernel
  * will actually grant; see `docs/backends/bwrap/bubblewrap-backend.md` for the
  * full list. There is deliberately no fallback to the weaker shared-host-network

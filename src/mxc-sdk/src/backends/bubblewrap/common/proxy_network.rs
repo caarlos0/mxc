@@ -46,9 +46,9 @@ const XTABLES_LOCK_PATH: &str = "/run/xtables.lock";
 ///
 /// The worst-case lock wait for every transaction plus explicit headroom,
 /// because the timer starts in [`ProxyNetworkNamespace::attach`] *before* slirp
-/// signals readiness and so also covers slirp startup. A single
-/// [`STARTUP_TIMEOUT`] cannot cover this: it would reject a viable sandbox the
-/// moment one call waited on a busy host.
+/// signals readiness and so also covers Bubblewrap loopback setup and slirp
+/// startup. A single [`STARTUP_TIMEOUT`] cannot cover this: it would reject a
+/// viable sandbox the moment one call waited on a busy host.
 ///
 /// A large policy needs more than one transaction per family, so this scales
 /// with the rendered payload count -- but only up to [`RULE_INSTALL_CEILING`].
@@ -91,7 +91,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Total budget for the advisory pre-flight probe surface.
 ///
-/// The launch path can afford [`PROBE_TIMEOUT`] on each of eight dependencies
+/// The launch path can afford [`PROBE_TIMEOUT`] on each of nine dependencies
 /// in turn; [`probe_proxy_enforcement`] cannot, because it runs behind a
 /// caller-owned timeout and is fail-closed, so being killed from outside would
 /// report the host as *unsupported*.
@@ -170,6 +170,21 @@ if [ -z "$child_pid" ]; then
     exit 1
 fi
 
+# The child PID is published before bwrap initializes loopback. Starting slirp
+# first brings lo up and creates 127.0.0.1/8, so bwrap's exclusive address
+# creation fails. The workload gate comes too late to order these two steps.
+ns="/proc/$child_pid/ns/net"
+while :; do
+    loopback=$(nsenter --net="$ns" -- ip -4 -o address show dev lo up) || {
+        echo "mxc: failed to query Bubblewrap loopback readiness" >&2
+        exit 1
+    }
+    case "$loopback" in
+        *" inet 127.0.0.1/8 "*) break ;;
+    esac
+    sleep 0.01
+done
+
 # slirp signals readiness internally so the supervisor, not slirp, decides when
 # the sandbox is ready -- the rules below must be in place first. Descriptor 9
 # is safe to hardcode: the parent hands this child exactly 0-4, so nothing else
@@ -188,7 +203,6 @@ while [ ! -s "$state_dir/slirp.internal" ]; do
     sleep 0.01
 done
 
-ns="/proc/$child_pid/ns/net"
 # Network filtering in both directions, programmed here because it needs
 # CAP_NET_ADMIN in the owning user namespace, which this supervisor holds
 # (`--keep-caps`) and the caller does not.
@@ -2001,15 +2015,16 @@ where
     )
 }
 
-/// Tools the in-namespace rules are programmed with: `(binary, probe flag,
+/// Tools for namespace readiness and rules: `(binary, probe flag,
 /// whether its backend must also be checked)`.
 ///
 /// `iptables` / `ip6tables` are probed even though the supervisor only runs the
 /// `-restore` variants: they carry the version banner the backend decision
 /// reads, and ship in the same package. Over-strict is safe here; under-strict
 /// would let a launch fail on a host the pre-flight called supported.
-const RULE_TOOL_PROBES: [(&str, &str, bool); 5] = [
+const RULE_TOOL_PROBES: [(&str, &str, bool); 6] = [
     ("nsenter", "--version", false),
+    ("ip", "-Version", false),
     ("iptables", "--version", true),
     ("ip6tables", "--version", true),
     ("iptables-restore", "--version", true),
@@ -2029,7 +2044,7 @@ enum SupervisorCommandCoverage {
 /// Digest of the reviewed [`SUPERVISOR_SCRIPT`], line-ending independent.
 /// Bumping it acknowledges that the command list below was re-checked.
 #[cfg(test)]
-const EXPECTED_SUPERVISOR_SCRIPT_DIGEST: u64 = 0xaaf9_be3f_4367_b7d8;
+const EXPECTED_SUPERVISOR_SCRIPT_DIGEST: u64 = 0x5165_3562_ed22_bacf;
 
 /// Every external command [`SUPERVISOR_SCRIPT`] runs, and how the pre-flight
 /// walk accounts for it.
@@ -2037,6 +2052,7 @@ const EXPECTED_SUPERVISOR_SCRIPT_DIGEST: u64 = 0xaaf9_be3f_4367_b7d8;
 const SUPERVISOR_EXTERNAL_COMMANDS: &[(&str, SupervisorCommandCoverage)] = &[
     ("slirp4netns", SupervisorCommandCoverage::Probed),
     ("nsenter", SupervisorCommandCoverage::Probed),
+    ("ip", SupervisorCommandCoverage::Probed),
     ("iptables-restore", SupervisorCommandCoverage::Probed),
     ("ip6tables-restore", SupervisorCommandCoverage::Probed),
     (
@@ -4262,7 +4278,7 @@ mod tests {
     /// surfaces as a dead supervisor mid-startup.
     #[test]
     fn the_rule_tools_the_supervisor_runs_are_probed() {
-        for binary in ["nsenter", "iptables-restore", "ip6tables-restore"] {
+        for binary in ["nsenter", "ip", "iptables-restore", "ip6tables-restore"] {
             assert!(
                 SUPERVISOR_SCRIPT.contains(binary),
                 "expected the supervisor to run '{binary}'"
@@ -4518,6 +4534,7 @@ mod tests {
             "slirp4netns",
             "unshare",
             "nsenter",
+            "ip",
             "iptables",
             "ip6tables",
             "iptables-restore",
@@ -5156,6 +5173,19 @@ mod tests {
     /// argument fails, as the real one does when a glob matched nothing and
     /// reached it unexpanded.
     const FAKE_NSENTER: &str = r#"#!/bin/sh
+case "$*" in
+    *" -- ip "*)
+        if [ ! -e "$MXC_TEST_LOOPBACK_QUERY" ]; then
+            printf '%s\n' "$*" > "$MXC_TEST_LOOPBACK_QUERY"
+        fi
+        if [ "$(cat "$MXC_TEST_LOOPBACK_STATE")" = "error" ]; then
+            echo "fake nsenter: sandbox network namespace disappeared" >&2
+            exit 1
+        fi
+        cat "$MXC_TEST_LOOPBACK_STATE"
+        exit 0
+        ;;
+esac
 count=$(cat "$MXC_TEST_COUNT" 2>/dev/null || echo 0)
 count=$((count + 1))
 printf '%s' "$count" > "$MXC_TEST_COUNT"
@@ -5189,6 +5219,13 @@ exit 0
     /// then idles so the supervisor's `wait` has something to wait on.
     const FAKE_SLIRP: &str = r#"#!/bin/sh
 echo $$ > "$MXC_TEST_SLIRP_PID"
+case "$(cat "$MXC_TEST_LOOPBACK_STATE")" in
+    *" inet 127.0.0.1/8 "*) ;;
+    *)
+        echo "fake slirp4netns: started before Bubblewrap initialized loopback" >&2
+        exit 1
+        ;;
+esac
 if [ "${MXC_TEST_SLIRP_DIES:-0}" = "1" ]; then
     echo "fake slirp4netns: exiting before readiness" >&2
     exit 1
@@ -5382,6 +5419,11 @@ exec sleep 30
         let state = dir.path().join("state");
         fs::create_dir_all(&bin).expect("bin dir");
         fs::create_dir_all(&state).expect("state dir");
+        fs::write(
+            dir.path().join("loopback.state"),
+            "1: lo    inet 127.0.0.1/8 scope host lo\n",
+        )
+        .expect("loopback state");
         for &family in families {
             let payloads =
                 render_filter_payloads(plan, ingress, family, TEST_CHAIN, TEST_INGRESS_CHAIN);
@@ -5417,6 +5459,8 @@ exec sleep 30
             .env("MXC_TEST_ARGS", dir.path().join("rules.args"))
             .env("MXC_TEST_PAYLOAD", dir.path().join("rules.payload"))
             .env("MXC_TEST_SLIRP_PID", dir.path().join("slirp.pid"))
+            .env("MXC_TEST_LOOPBACK_QUERY", dir.path().join("loopback.query"))
+            .env("MXC_TEST_LOOPBACK_STATE", dir.path().join("loopback.state"))
             .env(
                 "MXC_TEST_FAIL_AT",
                 fail_at.map(|n| n.to_string()).unwrap_or_default(),
@@ -5442,6 +5486,103 @@ exec sleep 30
             pid_writer: Some(File::from(pid_writer)),
             _exit_writer: exit_writer,
         }
+    }
+
+    #[test]
+    fn slirp_waits_for_bubblewrap_to_initialize_loopback() {
+        for pending in ["", "1: lo    inet 127.0.0.2/8 scope host lo\n"] {
+            let mut supervisor = spawn_fake_supervisor(None, false);
+            let state = supervisor.dir.path().join("loopback.state");
+            fs::write(&state, pending).expect("pending loopback state");
+            supervisor.publish_sandbox_pid();
+
+            wait_for_file(
+                supervisor.dir.path().join("loopback.query"),
+                &mut supervisor.child,
+                &supervisor.dir.path().join("supervisor.stderr"),
+                "loopback readiness query",
+                Duration::from_secs(20),
+            )
+            .expect("loopback must be queried before slirp starts");
+            assert!(
+                !supervisor.dir.path().join("slirp.pid").exists(),
+                "slirp started while loopback was not ready: {}",
+                supervisor.stderr()
+            );
+            assert_eq!(supervisor.rule_invocations(), 0);
+            assert!(!supervisor.signalled_ready());
+            let query = fs::read_to_string(supervisor.dir.path().join("loopback.query"))
+                .expect("query arguments");
+            assert_eq!(
+                query.trim(),
+                "--net=/proc/4242/ns/net -- ip -4 -o address show dev lo up"
+            );
+
+            fs::write(&state, "1: lo    inet 127.0.0.1/8 scope host lo\n")
+                .expect("initialized loopback state");
+            supervisor.wait_until_ready();
+            assert_eq!(supervisor.rule_invocations(), 2);
+        }
+    }
+
+    #[test]
+    fn a_failed_loopback_query_stops_startup_before_slirp() {
+        let mut supervisor = spawn_fake_supervisor(None, false);
+        fs::write(supervisor.dir.path().join("loopback.state"), "error")
+            .expect("failed loopback state");
+        supervisor.publish_sandbox_pid();
+
+        let status = supervisor.wait_for_exit();
+        assert!(!status.success(), "{status}");
+        assert!(
+            supervisor
+                .stderr()
+                .contains("network namespace disappeared"),
+            "{}",
+            supervisor.stderr()
+        );
+        assert!(
+            supervisor
+                .stderr()
+                .contains("failed to query Bubblewrap loopback readiness"),
+            "{}",
+            supervisor.stderr()
+        );
+        assert!(
+            !supervisor.dir.path().join("slirp.pid").exists(),
+            "slirp must not start after a failed loopback query"
+        );
+        assert_eq!(supervisor.rule_invocations(), 0);
+        assert!(!supervisor.signalled_ready());
+    }
+
+    #[test]
+    fn pending_loopback_uses_the_existing_network_startup_deadline() {
+        let mut supervisor = spawn_fake_supervisor(None, false);
+        fs::write(supervisor.dir.path().join("loopback.state"), "")
+            .expect("pending loopback state");
+        supervisor.publish_sandbox_pid();
+        wait_for_file(
+            supervisor.dir.path().join("loopback.query"),
+            &mut supervisor.child,
+            &supervisor.dir.path().join("supervisor.stderr"),
+            "loopback readiness query",
+            Duration::from_secs(20),
+        )
+        .expect("loopback query must start before the deadline is tested");
+
+        let error = wait_for_file(
+            supervisor.state_dir().join("slirp.ready"),
+            &mut supervisor.child,
+            &supervisor.dir.path().join("supervisor.stderr"),
+            "slirp4netns startup and network rule installation",
+            Duration::ZERO,
+        )
+        .expect_err("pending loopback must not bypass the network startup deadline");
+        assert!(error.contains("timed out"), "{error}");
+        assert!(!supervisor.dir.path().join("slirp.pid").exists());
+        assert_eq!(supervisor.rule_invocations(), 0);
+        assert!(!supervisor.signalled_ready());
     }
 
     /// An ordinary policy still fits one transaction per family, and both hooks
