@@ -6142,8 +6142,17 @@ exec sleep 30
             "nothing may open the workload gate after a failed attach"
         );
 
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !blocked_pid_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         let blocked_pid: u32 = fs::read_to_string(&blocked_pid_path)
-            .expect("the loopback query must have started")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the loopback query must have started: {error}; supervisor stderr: {}",
+                    stderr_detail(&network.state_dir.path().join("supervisor.stderr"))
+                )
+            })
             .trim()
             .parse()
             .expect("blocked pid");
