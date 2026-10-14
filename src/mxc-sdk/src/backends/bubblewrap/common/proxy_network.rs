@@ -19,11 +19,11 @@ use crate::mxc_common::filesystem_resolve::{resolve_mount_order, FsIntent};
 use crate::mxc_common::filesystem_symlink::resolve_through_symlinks;
 use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ContainerPolicy, ProxyAddress, ProxyHostPin};
+use crate::mxc_common::sandbox_process::group_kill;
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
-use nix::sys::signal::{killpg, Signal};
 use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
-use nix::unistd::{access, dup2, pipe2, AccessFlags, Pid};
+use nix::unistd::{access, dup2, pipe2, AccessFlags};
 use tempfile::TempDir;
 
 use crate::bwrap_common::bwrap_command::{COMMAND_TAIL, COMPAT_RUN_LINK, COMPAT_RUN_TARGET};
@@ -2390,13 +2390,12 @@ fn set_nonblocking(fd: RawFd) -> Result<(), String> {
 /// Kill the supervisor's whole process group, then reap the supervisor.
 ///
 /// Killing only the shell would leave a blocked `nsenter`, `ip`, or restore
-/// child running. The supervisor leads its own group (see [`ProxyNetworkNamespace::start`]),
-/// so the signal reaches every descendant that has not left it. The group is
-/// signalled before the leader is reaped, while its id is still guaranteed to
-/// name that group.
+/// child running. The supervisor leads its own group (see
+/// [`ProxyNetworkNamespace::start`]), and [`group_kill`] signals the leader
+/// before sweeping the group so a woken shell cannot start a child the sweep
+/// misses.
 fn terminate_child(child: &mut Child) {
-    let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
-    let _ = child.kill();
+    let _ = group_kill(child);
     let _ = child.wait();
 }
 
