@@ -4772,11 +4772,12 @@ mod tests {
     /// failing hosts that do meet every requirement.
     #[test]
     fn the_whole_dependency_walk_passes_on_a_host_that_meets_every_requirement() {
-        const CHECKED_TOOLS: [&str; 8] = [
+        const CHECKED_TOOLS: [&str; 9] = [
             "slirp4netns",
             "unshare",
             "sh",
             "nsenter",
+            "ip",
             "iptables",
             "ip6tables",
             "iptables-restore",
