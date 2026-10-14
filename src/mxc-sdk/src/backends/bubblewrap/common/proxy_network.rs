@@ -23,7 +23,8 @@ use crate::mxc_common::sandbox_process::group_kill;
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
-use nix::unistd::{access, dup2, pipe2, AccessFlags};
+use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+use nix::unistd::{access, dup2, pipe2, AccessFlags, Pid};
 use tempfile::TempDir;
 
 use crate::bwrap_common::bwrap_command::{COMMAND_TAIL, COMPAT_RUN_LINK, COMPAT_RUN_TARGET};
@@ -716,7 +717,7 @@ fn warn_skipped_ipv6_rules(kernel_ipv6: bool, logger: &mut Logger) {
 /// A same-UID user-namespace supervisor and its `slirp4netns` process.
 pub(crate) struct ProxyNetworkNamespace {
     state_dir: TempDir,
-    supervisor: Child,
+    supervisor: Supervisor,
     exit_writer: Option<OwnedFd>,
     /// Write end of the pipe carrying the sandbox PID to the supervisor.
     /// Dropping it without writing ends the supervisor's wait at EOF.
@@ -829,7 +830,7 @@ impl ProxyNetworkNamespace {
             ],
         );
 
-        let mut supervisor = command.spawn().map_err(|error| {
+        let mut supervisor = command.spawn().map(Supervisor::new).map_err(|error| {
             format!("Bubblewrap: failed to start proxy-network supervisor: {error}")
         })?;
         drop(exit_reader);
@@ -846,7 +847,7 @@ impl ProxyNetworkNamespace {
             "user namespace startup",
             STARTUP_TIMEOUT,
         ) {
-            terminate_child(&mut supervisor);
+            let _ = supervisor.terminate();
             return Err(error);
         }
 
@@ -854,7 +855,7 @@ impl ProxyNetworkNamespace {
         let userns = match File::open(&userns_path) {
             Ok(file) => file,
             Err(error) => {
-                terminate_child(&mut supervisor);
+                let _ = supervisor.terminate();
                 return Err(format!(
                     "Bubblewrap: failed to open proxy user namespace {userns_path}: {error}"
                 ));
@@ -866,7 +867,7 @@ impl ProxyNetworkNamespace {
             Some(pin) => {
                 let path = state_dir.path().join("hosts");
                 if let Err(error) = write_pinned_hosts(&path, pin) {
-                    terminate_child(&mut supervisor);
+                    let _ = supervisor.terminate();
                     return Err(error);
                 }
                 logger.log_line(&format!(
@@ -1014,7 +1015,7 @@ impl ProxyNetworkNamespace {
     /// `slirp.ready` is a latch that stays on disk after slirp dies, so the
     /// readiness [`Self::attach`] waited for can already be stale here.
     pub(crate) fn check_alive(&mut self) -> Result<(), String> {
-        match self.supervisor.try_wait() {
+        match self.supervisor.poll() {
             Ok(None) => Ok(()),
 
             // The supervisor's last act is to wait on slirp, so it outlives
@@ -1040,7 +1041,7 @@ impl ProxyNetworkNamespace {
     /// Describe the provider loss a monitor observed, for the error the run
     /// fails with.
     pub(crate) fn lost_provider_detail(&mut self) -> String {
-        let status = match self.supervisor.try_wait() {
+        let status = match self.supervisor.poll() {
             Ok(Some(status)) => format!("exited with {status}"),
             Ok(None) => "is still running, so slirp4netns died on its own".to_string(),
             Err(error) => format!("could not be inspected: {error}"),
@@ -1060,7 +1061,7 @@ impl ProxyNetworkNamespace {
         self.exit_writer.take();
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         loop {
-            match self.supervisor.try_wait() {
+            match self.supervisor.poll() {
                 Ok(Some(status)) => {
                     // A clean teardown closes the exit pipe and slirp leaves
                     // with success. Anything else means it died on its own --
@@ -1085,14 +1086,14 @@ impl ProxyNetworkNamespace {
                          ({})",
                         stderr_detail(&self.state_dir.path().join("supervisor.stderr"))
                     ));
-                    terminate_child(&mut self.supervisor);
+                    let _ = self.supervisor.terminate();
                     return;
                 }
                 Err(error) => {
                     logger.log_line(&format!(
                         "WARNING: Bubblewrap: failed to inspect slirp4netns shutdown: {error}"
                     ));
-                    terminate_child(&mut self.supervisor);
+                    let _ = self.supervisor.terminate();
                     return;
                 }
             }
@@ -2283,7 +2284,7 @@ fn read_stderr_tail(path: &std::path::Path) -> String {
 
 fn wait_for_file(
     path: impl AsRef<std::path::Path>,
-    child: &mut Child,
+    child: &mut Supervisor,
     stderr_path: &std::path::Path,
     component: &str,
     timeout: Duration,
@@ -2294,7 +2295,7 @@ fn wait_for_file(
         if fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
             return Ok(());
         }
-        if let Some(status) = child.try_wait().map_err(|error| {
+        if let Some(status) = child.poll().map_err(|error| {
             format!("Bubblewrap: failed to inspect {component} startup: {error}")
         })? {
             return Err(format!(
@@ -2387,16 +2388,59 @@ fn set_nonblocking(fd: RawFd) -> Result<(), String> {
         .map_err(|error| format!("Bubblewrap: failed to make descriptor nonblocking: {error}"))
 }
 
-/// Kill the supervisor's whole process group, then reap the supervisor.
+/// The namespace supervisor and the process group it leads.
 ///
-/// Killing only the shell would leave a blocked `nsenter`, `ip`, or restore
-/// child running. The supervisor leads its own group (see
-/// [`ProxyNetworkNamespace::start`]), and [`group_kill`] signals the leader
-/// before sweeping the group so a woken shell cannot start a child the sweep
-/// misses.
-fn terminate_child(child: &mut Child) {
-    let _ = group_kill(child);
-    let _ = child.wait();
+/// The leader stays unreaped until its group has been swept. [`group_kill`]
+/// signals the saved PID and group ID directly, so reaping first would let
+/// Linux reuse that ID for an unrelated process before the sweep runs.
+struct Supervisor {
+    child: Child,
+    exit: Option<ExitStatus>,
+}
+
+impl Supervisor {
+    fn new(child: Child) -> Self {
+        Self { child, exit: None }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The exit status once the supervisor has exited.
+    ///
+    /// Observing the exit also sweeps the group: a blocked `nsenter`, `ip` or
+    /// restore child must not outlive a supervisor that died first.
+    fn poll(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if self.exit.is_none() && has_exited_unreaped(self.child.id())? {
+            self.terminate()?;
+        }
+        Ok(self.exit)
+    }
+
+    /// Kill the supervisor's whole process group, then reap the leader.
+    ///
+    /// The leader is signalled before the sweep (see [`group_kill`]), so a
+    /// woken shell cannot start a child the sweep misses.
+    fn terminate(&mut self) -> std::io::Result<ExitStatus> {
+        if let Some(status) = self.exit {
+            return Ok(status);
+        }
+        group_kill(&mut self.child)?;
+        let status = self.child.wait()?;
+        self.exit = Some(status);
+        Ok(status)
+    }
+}
+
+/// Whether `pid` has exited without reaping it.
+fn has_exited_unreaped(pid: u32) -> std::io::Result<bool> {
+    waitid(
+        Id::Pid(Pid::from_raw(pid as i32)),
+        WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+    )
+    .map(|status| status != WaitStatus::StillAlive)
+    .map_err(std::io::Error::from)
 }
 
 #[cfg(test)]
@@ -5263,7 +5307,7 @@ exec sleep 30
     /// on demand, so the fail-closed ordering can be observed rather than read.
     struct FakeSupervisor {
         dir: TempDir,
-        child: Child,
+        child: Supervisor,
         pid_writer: Option<File>,
         _exit_writer: OwnedFd,
     }
@@ -5344,7 +5388,7 @@ exec sleep 30
         fn wait_for_exit(&mut self) -> ExitStatus {
             let deadline = Instant::now() + Duration::from_secs(20);
             while Instant::now() < deadline {
-                if let Some(status) = self.child.try_wait().expect("try_wait") {
+                if let Some(status) = self.child.poll().expect("poll") {
                     return status;
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -5362,7 +5406,7 @@ exec sleep 30
                 if self.signalled_ready() {
                     return;
                 }
-                if let Some(status) = self.child.try_wait().expect("try_wait") {
+                if let Some(status) = self.child.poll().expect("poll") {
                     panic!(
                         "supervisor exited ({status}) without signalling readiness; \
                          stderr: {}, rules run: {}",
@@ -5381,8 +5425,7 @@ exec sleep 30
 
     impl Drop for FakeSupervisor {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let _ = self.child.terminate();
             // `set -e` bypasses the script's TERM trap, so a stub left running
             // by an aborted supervisor has to be reaped here.
             if let Ok(pid) = fs::read_to_string(self.dir.path().join("slirp.pid")) {
@@ -5497,7 +5540,7 @@ exec sleep 30
                 (exit_reader.as_raw_fd(), SUPERVISOR_EXIT_FD),
             ],
         );
-        let child = command.spawn().expect("spawn supervisor");
+        let child = Supervisor::new(command.spawn().expect("spawn supervisor"));
         drop(exit_reader);
         drop(pid_reader);
 
@@ -6026,8 +6069,13 @@ exec sleep 30
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr))
             .spawn()
+            .map(Supervisor::new)
             .expect("spawn supervisor");
 
+        namespace_with(state_dir, supervisor)
+    }
+
+    fn namespace_with(state_dir: TempDir, supervisor: Supervisor) -> ProxyNetworkNamespace {
         ProxyNetworkNamespace {
             state_dir,
             supervisor,
@@ -6097,7 +6145,7 @@ exec sleep 30
                 (exit_reader.as_raw_fd(), SUPERVISOR_EXIT_FD),
             ],
         );
-        let supervisor = command.spawn().expect("spawn supervisor");
+        let supervisor = Supervisor::new(command.spawn().expect("spawn supervisor"));
         drop(exit_reader);
         drop(pid_reader);
 
@@ -6157,7 +6205,7 @@ exec sleep 30
             .expect("blocked pid");
         network.stop(&mut logger);
         assert!(
-            network.supervisor.try_wait().expect("try_wait").is_some(),
+            network.supervisor.poll().expect("poll").is_some(),
             "the supervisor must be reaped"
         );
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -6177,10 +6225,62 @@ exec sleep 30
         );
     }
 
+    /// A supervisor that exits while a child of its group is still blocked
+    /// must not leave that child behind, whichever path observes the exit.
+    #[test]
+    fn a_supervisor_that_exits_early_does_not_leave_its_group_running() {
+        for observe in ["poll", "stop"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pid_path = dir.path().join("blocked.pid");
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "sleep 300 & echo $! > \"$1\"", "mxc-test-supervisor"])
+                .arg(&pid_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            let mut supervisor = Supervisor::new(command.spawn().expect("spawn supervisor"));
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let blocked_pid: u32 = loop {
+                if let Ok(pid) = fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = pid.trim().parse() {
+                        break pid;
+                    }
+                }
+                assert!(Instant::now() < deadline, "the blocked child never started");
+                thread::sleep(Duration::from_millis(10));
+            };
+
+            if observe == "poll" {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while supervisor.poll().expect("poll").is_none() {
+                    assert!(Instant::now() < deadline, "supervisor did not exit");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            } else {
+                let mut network =
+                    namespace_with(tempfile::tempdir().expect("state dir"), supervisor);
+                let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+                network.stop(&mut logger);
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !process_is_gone(blocked_pid) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                process_is_gone(blocked_pid),
+                "{observe}: the blocked child {blocked_pid} outlived the supervisor"
+            );
+        }
+    }
+
     fn await_exit(namespace: &mut ProxyNetworkNamespace) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while Instant::now() < deadline {
-            if namespace.supervisor.try_wait().expect("try_wait").is_some() {
+            if namespace.supervisor.poll().expect("poll").is_some() {
                 return;
             }
             thread::sleep(Duration::from_millis(10));
