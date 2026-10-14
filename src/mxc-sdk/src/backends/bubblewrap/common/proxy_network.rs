@@ -21,8 +21,9 @@ use crate::mxc_common::logger::Logger;
 use crate::mxc_common::models::{ContainerPolicy, ProxyAddress, ProxyHostPin};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::sys::signal::{killpg, Signal};
 use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
-use nix::unistd::{access, dup2, pipe2, AccessFlags};
+use nix::unistd::{access, dup2, pipe2, AccessFlags, Pid};
 use tempfile::TempDir;
 
 use crate::bwrap_common::bwrap_command::{COMMAND_TAIL, COMPAT_RUN_LINK, COMPAT_RUN_TARGET};
@@ -813,7 +814,9 @@ impl ProxyNetworkNamespace {
             .arg(XTABLES_LOCK_WAIT.as_secs().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr));
+            .stderr(Stdio::from(stderr))
+            // Its own group, so a failed startup can kill every descendant.
+            .process_group(0);
         // Both pipes stay CLOEXEC in this process, so a concurrent spawn from
         // another thread cannot inherit them; only the supervisor gets them,
         // and only at the fixed numbers its script names.
@@ -969,6 +972,16 @@ impl ProxyNetworkNamespace {
 
     /// Give the supervisor the Bubblewrap child PID and wait for slirp readiness.
     pub(crate) fn attach(&mut self, child_pid: u32, logger: &mut Logger) -> Result<(), String> {
+        let timeout = rule_install_timeout(self.transactions, self.script_timeout_ms);
+        self.attach_within(child_pid, timeout, logger)
+    }
+
+    fn attach_within(
+        &mut self,
+        child_pid: u32,
+        timeout: Duration,
+        logger: &mut Logger,
+    ) -> Result<(), String> {
         let mut writer = self
             .pid_writer
             .take()
@@ -986,7 +999,7 @@ impl ProxyNetworkNamespace {
             // Written after slirp is up *and* both rule sets are installed, so
             // naming slirp alone would send the reader to the wrong place.
             "slirp4netns startup and network rule installation",
-            rule_install_timeout(self.transactions, self.script_timeout_ms),
+            timeout,
         )?;
         logger.log_line(
             "Bubblewrap: slirp4netns configured the private network namespace and the network \
@@ -2374,7 +2387,15 @@ fn set_nonblocking(fd: RawFd) -> Result<(), String> {
         .map_err(|error| format!("Bubblewrap: failed to make descriptor nonblocking: {error}"))
 }
 
+/// Kill the supervisor's whole process group, then reap the supervisor.
+///
+/// Killing only the shell would leave a blocked `nsenter`, `ip`, or restore
+/// child running. The supervisor leads its own group (see [`ProxyNetworkNamespace::start`]),
+/// so the signal reaches every descendant that has not left it. The group is
+/// signalled before the leader is reaped, while its id is still guaranteed to
+/// name that group.
 fn terminate_child(child: &mut Child) {
+    let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -6020,6 +6041,132 @@ exec sleep 30
             transactions: 0,
             script_timeout_ms: 0,
         }
+    }
+
+    /// `nsenter` stand-in that never returns, like a query stuck in a wedged
+    /// namespace. It `exec`s, so the recorded PID is the blocked process itself.
+    const BLOCKING_NSENTER: &str =
+        "#!/bin/sh\necho $$ > \"$MXC_TEST_BLOCKED_PID\"\nexec sleep 300\n";
+
+    fn process_is_gone(pid: u32) -> bool {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with('Z')),
+        }
+    }
+
+    /// Drives the real supervisor script and the production `attach` and
+    /// `stop` through a loopback query that never returns: the deadline must
+    /// apply, the workload gate must stay closed, and the blocked child -- not
+    /// just the supervisor shell -- must be gone afterwards.
+    #[test]
+    fn a_blocked_loopback_query_fails_attach_without_opening_the_gate_or_leaking_children() {
+        let state_dir = tempfile::tempdir().expect("tempdir");
+        let bin = state_dir.path().join("bin");
+        fs::create_dir_all(&bin).expect("bin dir");
+        install_stub(&bin.join("nsenter"), BLOCKING_NSENTER);
+        let blocked_pid_path = state_dir.path().join("blocked.pid");
+        let stderr = File::create(state_dir.path().join("supervisor.stderr")).expect("stderr");
+        let (exit_reader, exit_writer) = pipe2(OFlag::O_CLOEXEC).expect("exit pipe");
+        let (pid_reader, pid_writer) = pipe2(OFlag::O_CLOEXEC).expect("pid pipe");
+
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", SUPERVISOR_SCRIPT, "mxc-test-supervisor"])
+            .arg(state_dir.path())
+            .arg("1")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("MXC_TEST_BLOCKED_PID", &blocked_pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .process_group(0);
+        remap_descriptors(
+            &mut command,
+            [
+                (pid_reader.as_raw_fd(), SUPERVISOR_PID_FD),
+                (exit_reader.as_raw_fd(), SUPERVISOR_EXIT_FD),
+            ],
+        );
+        let supervisor = command.spawn().expect("spawn supervisor");
+        drop(exit_reader);
+        drop(pid_reader);
+
+        let mut network = ProxyNetworkNamespace {
+            state_dir,
+            supervisor,
+            exit_writer: Some(exit_writer),
+            pid_writer: Some(pid_writer),
+            userns: Some(File::open("/dev/null").expect("stand-in namespace handle")),
+            hosts: None,
+            resolver: None,
+            liveness_reader: None,
+            transactions: 0,
+            script_timeout_ms: 0,
+        };
+        let mut logger = Logger::new(crate::mxc_common::logger::Mode::Buffer);
+        let mut startup = network
+            .configure_bwrap(&mut Vec::new(), &mut logger)
+            .expect("startup descriptors");
+        let gate = startup.gate_reader.take().expect("gate reader");
+        set_nonblocking(gate.as_raw_fd()).expect("nonblocking gate");
+        let mut gate = File::from(gate);
+
+        // The runner only calls `release` after `attach` succeeds.
+        let error = network
+            .attach_within(4242, Duration::from_secs(3), &mut logger)
+            .expect_err("a blocked loopback query must fail the startup");
+        assert!(
+            error.contains(
+                "timed out waiting for slirp4netns startup and network rule installation"
+            ),
+            "{error}"
+        );
+
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            gate.read(&mut byte)
+                .expect_err("the gate is still held")
+                .kind(),
+            ErrorKind::WouldBlock,
+            "nothing may open the workload gate after a failed attach"
+        );
+
+        let blocked_pid: u32 = fs::read_to_string(&blocked_pid_path)
+            .expect("the loopback query must have started")
+            .trim()
+            .parse()
+            .expect("blocked pid");
+        network.stop(&mut logger);
+        assert!(
+            network.supervisor.try_wait().expect("try_wait").is_some(),
+            "the supervisor must be reaped"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_gone(blocked_pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            process_is_gone(blocked_pid),
+            "the blocked nsenter child {blocked_pid} outlived the supervisor"
+        );
+
+        drop(startup);
+        assert_eq!(
+            gate.read(&mut byte).expect("the gate writer is closed"),
+            0,
+            "the gate must close without ever having been released"
+        );
     }
 
     fn await_exit(namespace: &mut ProxyNetworkNamespace) {

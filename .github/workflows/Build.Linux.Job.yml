@@ -110,6 +110,26 @@ jobs:
           # sandbox can start (no-op on kernels without this knob).
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
+      # The proxy-network unit tests drive the real supervisor script against
+      # stubs and need `ip` (iproute2) from the install above. The module is not
+      # covered by any other filter, so a zero-test run must fail.
+      - name: Test Bubblewrap proxy_network module
+        working-directory: src
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$(mktemp)"
+          cargo test --locked --release --target "${{ matrix.target }}" \
+            -p mxc-sdk --lib 'backend_modules::bubblewrap::common::proxy_network::' 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          if ! grep -qE 'test result: ok\. [1-9][0-9]* passed' "$log"; then
+            echo "::error::Bubblewrap proxy_network module filter ran no tests."
+            exit 1
+          fi
+
       # The job defaults working-directory to src/tools/lxc, so the `Test lxc`
       # step above covers only the lxc package. This streaming suite must follow
       # the install. Strict mode makes a failed availability probe fail this
